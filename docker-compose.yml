@@ -1,15 +1,10 @@
 services:
-  web:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    volumes:
-      - .:/app
-      - /data/kuzi/:/data:ro
+  ripgrep-webui:
+    image: stu2116edwardhu/ripgrep-webui
+    container_name: ripgrep-webui
     ports:
       - "5757:5000"
-    environment:
-      - GUNICORN_CMD_ARGS=-w 1 -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker
-      #- FLASK_ENV=development
-      #- PYTHONUNBUFFERED=TRUE
+    volumes:
+      - /data/kuzi:/data:ro
+      - ./exports:/app/exports
     restart: always
