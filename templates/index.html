@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>文件内容检索系统</title>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.3.1/css/bootstrap.min.css ">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js "></script>
+    <style>
+        html, body { height: 100%; }
+        .container { height: 100%; }
+        #result {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            overflow: auto;
+            background: #f8f9fa;
+            padding: 12px;
+            border-radius: 6px;
+            max-height: calc(70vh);
+            min-height: 200px;
+            box-shadow: inset 0 0 0 1px rgba(0,0,0,0.04);
+        }
+        @media (max-width: 768px) {
+            #result { max-height: calc(60vh); min-height: 150px; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="row">
+        <div class="col-lg-8 col-md-10 mx-auto">
+            <h2 class="text-center mb-4">文件内容检索系统</h2>
+            <form class="mb-4 px-2 py-3 bg-white rounded shadow-sm">
+                <div class="row g-2 align-items-center">
+                    <div class="col-12 col-md-5 mb-2 mb-md-0">
+                        <input type="text" id="keyword" class="form-control" placeholder="输入关键词" style="font-size:1.1em;">
+                    </div>
+                    <div class="col-6 col-md-2">
+                        <input type="number" id="context_before" class="form-control" placeholder="上文" min="0">
+                    </div>
+                    <div class="col-6 col-md-2">
+                        <input type="number" id="context_after" class="form-control" placeholder="下文" min="0">
+                    </div>
+                    <div class="col-12 col-md-3 mt-2 mt-md-0">
+                        <select id="file" class="form-control">
+                            <option value="">所有文件 (默认)</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="row mt-3 g-2">
+                    <div class="col-6 col-md-3">
+                        <button type="button" class="btn btn-outline-primary w-100" onclick="sendKeyword()">提交</button>
+                    </div>
+                    <div class="col-6 col-md-3">
+                        <button type="button" class="btn btn-outline-danger w-100" onclick="cancelSearch()">取消</button>
+                    </div>
+                    <div class="col-6 col-md-3 mt-2 mt-md-0">
+                        <button type="button" class="btn btn-outline-warning w-100" onclick="clearResult()">清空</button>
+                    </div>
+                    <div class="col-6 col-md-3 mt-2 mt-md-0">
+                        <button type="button" class="btn btn-outline-secondary w-100" onclick="exportResult()">导出</button>
+                    </div>
+                </div>
+            </form>
+            <pre id="result" class="mt-4"></pre>
+        </div>
+    </div>
+</div>
+<script>
+var socket = io({path: '/io'});
+
+window.addEventListener('DOMContentLoaded', function(){
+    fetch('/files')
+    .then(r => r.ok ? r.json() : Promise.reject())
+    .then(list => {
+        const sel = document.getElementById('file');
+        list.forEach(fn => {
+            const opt = document.createElement('option');
+            opt.value = fn; opt.textContent = fn;
+            sel.appendChild(opt);
+        });
+    }).catch(() => {});
+});
+
+socket.on('message', data => {
+    const text = data.message.replace(/\r?\n/g, '\n');
+    /* 静默：不把“??? Cancelled ???”显示到页面 */
+    if (text.includes('??? Cancelled ???')) return;
+    document.getElementById('result').textContent = text + document.getElementById('result').textContent;
+});
+
+function sendKeyword() {
+    const kw = document.getElementById('keyword').value.trim();
+    if (!kw) {
+        alert('请输入关键词后再提交！');
+        return;
+    }
+    const before = parseInt(document.getElementById('context_before').value || '0', 10);
+    const after  = parseInt(document.getElementById('context_after').value || '0', 10);
+    const file   = document.getElementById('file').value || '';
+    fetch('/search', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({keyword: kw, context_before: before, context_after: after, file})
+    });
+}
+
+function cancelSearch() {
+    fetch('/cancel', {method: 'POST'});
+}
+
+function clearResult() {
+    document.getElementById('result').textContent = '';
+}
+
+function exportResult() {
+    const content = document.getElementById('result').textContent
+                      .split('\n')
+                      .filter(line => !line.includes('??? Cancelled ???'))
+                      .join('\n');
+    if (!content.trim()) {
+        alert('检索结果为空，无需导出！');
+        return;
+    }
+    const kw = document.getElementById('keyword').value.trim().replace(/[^\w\u4e00-\u9fa5\-_ ]/g, '');
+    const fn = `${kw || 'search'}_${new Date().toISOString().slice(0,10)}_${Date.now()}.txt`;
+    const blob = new Blob([content], {type: 'text/plain'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = fn;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+window.addEventListener('beforeunload', () => cancelSearch());
+</script>
+</body>
+</html>
