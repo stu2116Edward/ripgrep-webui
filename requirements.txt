@@ -3,3 +3,6 @@ gunicorn
 flask-socketio
 gevent
 gevent-websocket
+py7zr
+rarfile
+lz4
