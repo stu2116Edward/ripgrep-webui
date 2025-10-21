@@ -77,14 +77,6 @@ def index():
 
 @app.route('/search', methods=['POST'])
 def search():
-    """
-    改进点（本次提交）：
-    - 在启动搜索前尽量计算要处理的文件总数 total_files（主目录可搜索文件 + 每个压缩文件（1） + 归档内文件数）。
-    - 在解析 ripgrep JSON 流时，监听 'begin' 事件并把 files_done++，实时发送 progress 事件：
-      {files_total, files_done, matches}
-      注意：已移除 'current' 字段以减少带宽与日志量（前端也不再显示当前文件名）。
-    - 保持 match_count 语义：按实际输出的非空结果区块计数（即前端看到多少条内容，matches 与显示一致）。
-    """
     global proc, extra_procs, temp_dirs
     if proc is not None:
         socketio.emit('message', {'message': '?????? Busy ??????\n'})
