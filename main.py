@@ -8,6 +8,7 @@ import time
 import tempfile
 import shutil
 import queue
+import io
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", path='/io')
@@ -23,7 +24,11 @@ output_buffers = {}  # 关键字 -> 行内容列表
 
 # 支持的压缩/归档后缀（用于目录扫描时识别并单独处理）
 SINGLE_COMPRESSED_EXTS = ('.gz', '.bz2', '.xz', '.lz4', '.lzma')
-ARCHIVE_EXTS = ('.zip', '.jar', '.war', '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz')
+ARCHIVE_EXTS = (
+    '.zip', '.jar', '.war',
+    '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz',
+    '.7z', '.rar'   # 支持 .7z / .rar
+)
 
 
 def is_single_file_compressed(filename_lower):
@@ -34,17 +39,141 @@ def is_archive_multi_file(filename_lower):
     return filename_lower.endswith(ARCHIVE_EXTS)
 
 
+def has_cmd(name):
+    """Check if external command exists in PATH."""
+    return shutil.which(name) is not None
+
+
+def try_py7zr_extract(archive_path, dest):
+    """Try to extract 7z (and many other formats) using py7zr if available."""
+    try:
+        import py7zr
+    except Exception:
+        return False, "py7zr not available"
+    try:
+        with py7zr.SevenZipFile(archive_path, mode='r') as z:
+            z.extractall(path=dest)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def try_rarfile_extract(archive_path, dest):
+    """Try to extract rar using rarfile python lib if available."""
+    try:
+        import rarfile
+    except Exception:
+        return False, "rarfile not available"
+    try:
+        rf = rarfile.RarFile(archive_path)
+        rf.extractall(dest)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def start_rg_and_feed_python_stream(rg_cmd, feed_fn):
+    """
+    Start rg process with stdin=PIPE and run feed_fn(writer) in a thread to write decompressed bytes.
+    feed_fn should accept a single argument: a writable binary file-like (rg_proc.stdin).
+    Returns the rg process.
+    """
+    rg_proc = subprocess.Popen(
+        rg_cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        shell=False,
+        preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+    )
+
+    def writer_thread():
+        try:
+            with rg_proc.stdin:
+                feed_fn(rg_proc.stdin)
+        except Exception:
+            try:
+                rg_proc.stdin.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=writer_thread, daemon=True)
+    t.start()
+    return rg_proc
+
+
+def python_decompress_feed(path, ext, out_stream):
+    """Feed decompressed bytes to out_stream (binary write). Supports gzip,bz2,lzma and tries lz4 if available."""
+    ext = ext.lower()
+    try:
+        if ext.endswith('.gz'):
+            import gzip
+            with gzip.open(path, 'rb') as f:
+                shutil.copyfileobj(f, out_stream)
+        elif ext.endswith('.bz2'):
+            import bz2
+            with bz2.open(path, 'rb') as f:
+                shutil.copyfileobj(f, out_stream)
+        elif ext.endswith('.xz') or ext.endswith('.txz') or ext.endswith('.lzma'):
+            import lzma
+            with lzma.open(path, 'rb') as f:
+                shutil.copyfileobj(f, out_stream)
+        elif ext.endswith('.lz4'):
+            # try python lz4.frame
+            try:
+                import lz4.frame as lz4frame
+                with open(path, 'rb') as raw:
+                    decompressor = lz4frame.LZ4FrameDecompressor()
+                    while True:
+                        chunk = raw.read(64 * 1024)
+                        if not chunk:
+                            break
+                        out = decompressor.decompress(chunk)
+                        if out:
+                            out_stream.write(out)
+            except Exception:
+                # fallback: no python lz4 -> raise so caller can try external tool
+                raise
+        else:
+            # unknown extension
+            raise RuntimeError("Unsupported python decompressor for ext: " + ext)
+    except Exception:
+        # re-raise to caller to handle fallback
+        raise
+
+
 def build_decompress_command(path_lower, real_path):
+    path_lower = path_lower.lower()
     if path_lower.endswith('.gz'):
-        return ['gzip', '-dc', real_path]
+        if has_cmd('gzip'):
+            return ['gzip', '-dc', real_path]
+        else:
+            return None  # allow python fallback
     if path_lower.endswith('.bz2'):
-        return ['bzip2', '-dc', real_path]
+        if has_cmd('bzip2'):
+            return ['bzip2', '-dc', real_path]
+        else:
+            return None
     if path_lower.endswith('.xz') or path_lower.endswith('.txz'):
-        return ['xz', '-dc', real_path]
+        if has_cmd('xz'):
+            return ['xz', '-dc', real_path]
+        else:
+            return None
     if path_lower.endswith('.lz4'):
-        return ['lz4', '-dc', real_path]
+        if has_cmd('lz4'):
+            return ['lz4', '-dc', real_path]
+        else:
+            return None
     if path_lower.endswith('.lzma'):
-        return ['lzma', '-dc', real_path]
+        if has_cmd('lzma'):
+            return ['lzma', '-dc', real_path]
+        else:
+            return None
+    # for 7z/rar try 7z if available (7z -so)
+    if path_lower.endswith(('.7z', '.rar')):
+        if has_cmd('7z'):
+            return ['7z', 'x', '-so', real_path]
+        # fallthrough to python-based handling (py7zr/rarfile) in archive extraction path
     return None
 
 
@@ -116,14 +245,14 @@ def search():
 
     # 将要运行并监听输出的 rg 进程列表（主 rg + 为每个压缩/归档额外启动的 rg）
     all_rg_procs = []
-    # 附加的系统解压/解包进程（解压器、bsdtar/unzip/rg），便于 cancel 清理
+    # 附加的系统解压/解包进程（解压器、bsdtar/unzip/7z/rg），便于 cancel 清理
     extra_procs_local = []
 
     # 预先计算 total_files（尽量精确）
     total_files = 0
     try:
         # Helper: 启动 rg 并加入监听列表
-        def start_rg_for_path(path, stdin_pipe=None, label=None, exclude_patterns=None):
+        def start_rg_for_path(path, stdin_pipe=None, label=None, exclude_patterns=None, python_stream_feed=None):
             cmd = rg_base.copy()
             if exclude_patterns:
                 for pat in exclude_patterns:
@@ -132,47 +261,60 @@ def search():
                 cmd += ['--label', label, '--', keyword, '-']
             else:
                 cmd += ['--', keyword, path]
-            rg_proc = subprocess.Popen(
-                cmd,
-                stdin=stdin_pipe,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                shell=False,
-                preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
-            )
+
+            if python_stream_feed:
+                # start rg and feed using python
+                rg_proc = start_rg_and_feed_python_stream(cmd, python_stream_feed)
+            else:
+                rg_proc = subprocess.Popen(
+                    cmd,
+                    stdin=stdin_pipe,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    shell=False,
+                    preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                )
             all_rg_procs.append(rg_proc)
             return rg_proc
 
-        # If user specified a single existing file -> handle as before
+        # If user specified a single existing file -> handle as before but with python fallbacks
         if file and os.path.isfile(search_path):
             file_lower = file.lower()
             if is_single_file_compressed(file_lower):
                 # single compressed file counts as 1 input file
                 total_files = 1
+                # Prefer external command if available, else use python streaming
                 dec_cmd = build_decompress_command(file_lower, search_path)
-                if dec_cmd is None:
-                    socketio.emit('message', {'message': f'?? Unsupported compressed format for {file}\n'})
-                    return "Unsupported format"
-                try:
-                    decompressor_proc = subprocess.Popen(
-                        dec_cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        shell=False,
-                        preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
-                    )
-                    extra_procs_local.append(decompressor_proc)
-                    extra_procs.append(decompressor_proc)
-                except FileNotFoundError:
-                    socketio.emit('message', {'message': f'?? Missing decompressor for {file}: {dec_cmd[0]}\n'})
-                    return "Missing decompressor"
                 safe_label = os.path.basename(file)
-                start_rg_for_path('-', stdin_pipe=decompressor_proc.stdout, label=safe_label)
+                if dec_cmd:
+                    try:
+                        decompressor_proc = subprocess.Popen(
+                            dec_cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            shell=False,
+                            preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                        )
+                        extra_procs_local.append(decompressor_proc)
+                        extra_procs.append(decompressor_proc)
+                        start_rg_for_path('-', stdin_pipe=decompressor_proc.stdout, label=safe_label)
+                    except FileNotFoundError:
+                        # fallback to python stream
+                        def feed_fn(w):
+                            python_decompress_feed(search_path, file_lower, w)
+                        start_rg_for_path('-', label=safe_label, python_stream_feed=feed_fn)
+                else:
+                    # python decompressor path
+                    def feed_fn(w):
+                        python_decompress_feed(search_path, file_lower, w)
+                    start_rg_for_path('-', label=safe_label, python_stream_feed=feed_fn)
+
             elif is_archive_multi_file(file_lower):
-                # extract to temp dir using python stdlib first, fallback to external extractor
+                # extract to temp dir using python stdlib first, fallback to py7zr/rarfile, then external tools
                 temp_dir_for_archive = tempfile.mkdtemp(prefix='rg_archive_')
                 temp_dirs.append(temp_dir_for_archive)
                 extracted_ok = False
+                # try python stdlib zip/tar
                 try:
                     import tarfile, zipfile
                     if file_lower.endswith(('.zip', '.jar', '.war')):
@@ -185,10 +327,29 @@ def search():
                         extracted_ok = True
                 except Exception:
                     extracted_ok = False
+
+                # try py7zr for 7z, and rarfile for rar
                 if not extracted_ok:
+                    if file_lower.endswith('.7z'):
+                        ok, msg = try_py7zr_extract(search_path, temp_dir_for_archive)
+                        if ok:
+                            extracted_ok = True
+                    elif file_lower.endswith('.rar'):
+                        ok, msg = try_rarfile_extract(search_path, temp_dir_for_archive)
+                        if ok:
+                            extracted_ok = True
+
+                if not extracted_ok:
+                    # fallback to external extractor: unzip / 7z / bsdtar
                     try:
                         if file_lower.endswith(('.zip', '.jar', '.war')):
                             extract_cmd = ['unzip', '-qq', search_path, '-d', temp_dir_for_archive]
+                        elif file_lower.endswith(('.7z', '.rar')):
+                            # use 7z if available
+                            if has_cmd('7z'):
+                                extract_cmd = ['7z', 'x', '-y', search_path, f'-o{temp_dir_for_archive}']
+                            else:
+                                raise FileNotFoundError('7z not available')
                         else:
                             extract_cmd = ['bsdtar', '-xf', search_path, '-C', temp_dir_for_archive]
                         extract_proc = subprocess.Popen(
@@ -211,13 +372,15 @@ def search():
                             temp_dirs.remove(temp_dir_for_archive)
                             return "Extraction failed"
                     except FileNotFoundError:
-                        socketio.emit('message', {'message': f'?? Missing extractor (bsdtar/unzip) on system\n'})
+                        # no extractor available -> inform user but continue gracefully (skip this archive)
+                        socketio.emit('message', {'message': f'?? Missing extractor on system for archive: {file}\n'})
                         try:
                             shutil.rmtree(temp_dir_for_archive)
                         except Exception:
                             pass
                         temp_dirs.remove(temp_dir_for_archive)
                         return "Missing extractor"
+
                 # count files in extracted temp dir
                 cnt = 0
                 for _, _, fns in os.walk(temp_dir_for_archive):
@@ -225,12 +388,13 @@ def search():
                         cnt += 1
                 total_files = cnt if cnt > 0 else 1
                 start_rg_for_path(temp_dir_for_archive)
+
             else:
                 # single normal file: count as 1
                 total_files = 1
                 start_rg_for_path(search_path)
         else:
-            # Directory search (default) -> want to include compressed files & archives
+            # Directory search (default) -> include compressed and archives
             non_excluded_count = 0
             compressed_files = []
             archive_files = []
@@ -246,7 +410,7 @@ def search():
                     else:
                         non_excluded_count += 1
             total_files = non_excluded_count + len(compressed_files)
-            # For archives, extract and count files inside (add to total)
+            # For archives, extract and count files inside (add to total). Use py7zr/rarfile if available, else external
             for full_archive in archive_files:
                 try:
                     temp_dir_for_archive = tempfile.mkdtemp(prefix='rg_archive_')
@@ -265,9 +429,23 @@ def search():
                     except Exception:
                         extracted_ok = False
                     if not extracted_ok:
+                        if full_archive.lower().endswith('.7z'):
+                            ok, msg = try_py7zr_extract(full_archive, temp_dir_for_archive)
+                            if ok:
+                                extracted_ok = True
+                        elif full_archive.lower().endswith('.rar'):
+                            ok, msg = try_rarfile_extract(full_archive, temp_dir_for_archive)
+                            if ok:
+                                extracted_ok = True
+                    if not extracted_ok:
                         try:
                             if full_archive.lower().endswith(('.zip', '.jar', '.war')):
                                 extract_cmd = ['unzip', '-qq', full_archive, '-d', temp_dir_for_archive]
+                            elif full_archive.lower().endswith(('.7z', '.rar')):
+                                if has_cmd('7z'):
+                                    extract_cmd = ['7z', 'x', '-y', full_archive, f'-o{temp_dir_for_archive}']
+                                else:
+                                    raise FileNotFoundError('7z not available')
                             else:
                                 extract_cmd = ['bsdtar', '-xf', full_archive, '-C', temp_dir_for_archive]
                             extract_proc = subprocess.Popen(
@@ -305,34 +483,45 @@ def search():
                 except Exception:
                     # skip problematic archive
                     continue
+
             # start main rg for non-compressed files, excluding compressed/archives to avoid duplicates
             exclude_patterns = []
             for ext in SINGLE_COMPRESSED_EXTS + ARCHIVE_EXTS:
                 exclude_patterns.append(f'**/*{ext}')
-            # only start main rg if there are non-excluded files or to ensure directory traversal by rg
             start_rg_for_path(search_path, exclude_patterns=exclude_patterns)
 
-            # start rg for each compressed file (streamed)
+            # start rg for each compressed file (streamed). Prefer external tool; if missing, use python stream feed
             for full in compressed_files:
                 fn = os.path.basename(full)
                 fn_lower = fn.lower()
                 dec_cmd = build_decompress_command(fn_lower, full)
-                if dec_cmd is None:
-                    continue
-                try:
-                    decompressor_proc = subprocess.Popen(
-                        dec_cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        shell=False,
-                        preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
-                    )
-                    extra_procs_local.append(decompressor_proc)
-                    extra_procs.append(decompressor_proc)
-                except FileNotFoundError:
-                    continue
                 rel_label = os.path.relpath(full, data_dir)
-                start_rg_for_path('-', stdin_pipe=decompressor_proc.stdout, label=rel_label)
+                if dec_cmd:
+                    try:
+                        decompressor_proc = subprocess.Popen(
+                            dec_cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            shell=False,
+                            preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                        )
+                        extra_procs_local.append(decompressor_proc)
+                        extra_procs.append(decompressor_proc)
+                        start_rg_for_path('-', stdin_pipe=decompressor_proc.stdout, label=rel_label)
+                    except FileNotFoundError:
+                        # fallback to python feed
+                        def feed_fn(w, p=full, e=fn_lower):
+                            python_decompress_feed(p, e, w)
+                        start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                else:
+                    # try python feed
+                    def feed_fn(w, p=full, e=fn_lower):
+                        python_decompress_feed(p, e, w)
+                    try:
+                        start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                    except Exception:
+                        # if python feed fails, skip
+                        continue
 
         # If no rg started, error
         if not all_rg_procs:
@@ -384,9 +573,8 @@ def search():
         proc = None
         return "Error"
 
-    # -----------------------
+    
     # 读取与解析合并后的流（从队列读取）
-    # -----------------------
     def get_output_loop():
         global proc, extra_procs, temp_dirs
         buf = []
@@ -452,7 +640,7 @@ def search():
                     if typ == 'begin':
                         # increment files_done when a new file begins
                         files_done += 1
-                        # send progress update with files_done (removed 'current' field)
+                        # send progress update with files_done (no 'current' field)
                         socketio.emit('progress', {
                             'matches': match_count,
                             'files_total': total_files,
