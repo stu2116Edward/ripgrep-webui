@@ -22,14 +22,60 @@
         @media (max-width: 768px) {
             #result { max-height: calc(60vh); min-height: 150px; }
         }
+
+        /* Progress box styling */
+        .progress-wrap {
+            margin-top: 12px;
+            background: linear-gradient(180deg, #ffffff, #f7f9fb);
+            padding: 10px;
+            border-radius: 8px;
+            box-shadow: 0 6px 18px rgba(0,0,0,0.04);
+            display: none; /* hidden by default */
+            align-items: center;
+        }
+        .progress-info {
+            display:flex;
+            align-items:center;
+            gap:12px;
+            width:100%;
+        }
+        .progress-label {
+            min-width: 140px;
+            font-size: 0.95rem;
+            color:#495057;
+            display:flex;
+            align-items:center;
+            gap:8px;
+        }
+        .progress-status-badge {
+            font-size: 0.75rem;
+            padding: 0.25em 0.5em;
+            border-radius: 999px;
+        }
+
+        /* match display under title */
+        #matchDisplay {
+            font-weight: 600;
+            color: #1f618d;
+            margin-bottom: 8px;
+        }
+
+        /* small responsive spacing */
+        @media (max-width: 576px) {
+            .progress-label { min-width: 100px; font-size: 0.85rem; }
+        }
     </style>
 </head>
 <body>
 <div class="container">
     <div class="row">
         <div class="col-lg-8 col-md-10 mx-auto">
-            <h2 class="text-center mb-4">文件内容检索系统</h2>
-            <form class="mb-4 px-2 py-3 bg-white rounded shadow-sm">
+            <h2 class="text-center mb-2">文件内容检索系统</h2>
+
+            <!-- 专属一行显示匹配数（居中、独占一行） -->
+            <div id="matchDisplay" class="text-center">匹配：0 条</div>
+
+            <form class="mb-2 px-2 py-3 bg-white rounded shadow-sm">
                 <div class="row g-2 align-items-center">
                     <div class="col-12 col-md-5 mb-2 mb-md-0">
                         <input type="text" id="keyword" class="form-control" placeholder="输入关键词" style="font-size:1.1em;">
@@ -48,18 +94,38 @@
                 </div>
                 <div class="row mt-3 g-2">
                     <div class="col-6 col-md-3">
-                        <button type="button" class="btn btn-outline-primary w-100" onclick="sendKeyword()">提交</button>
+                        <button type="button" id="submitBtn" class="btn btn-outline-primary w-100" onclick="sendKeyword()">提交</button>
                     </div>
                     <div class="col-6 col-md-3">
-                        <button type="button" class="btn btn-outline-danger w-100" onclick="cancelSearch()">取消</button>
+                        <button type="button" id="cancelBtn" class="btn btn-outline-danger w-100" onclick="cancelSearch()">取消</button>
                     </div>
                     <div class="col-6 col-md-3 mt-2 mt-md-0">
-                        <button type="button" class="btn btn-outline-warning w-100" onclick="clearResult()">清空</button>
+                        <button type="button" id="clearBtn" class="btn btn-outline-warning w-100" onclick="clearResult()">清空</button>
                     </div>
                     <div class="col-6 col-md-3 mt-2 mt-md-0">
-                        <button type="button" class="btn btn-outline-secondary w-100" onclick="exportResult()">导出</button>
+                        <button type="button" id="exportBtn" class="btn btn-outline-secondary w-100" onclick="exportResult()">导出</button>
                     </div>
                 </div>
+
+                <!-- Progress area (hidden by default) -->
+                <div id="progressWrap" class="progress-wrap mt-3">
+                    <div class="progress-info w-100">
+                        <div class="progress-label">
+                            <strong id="progressTitle">检索进度</strong>
+                            <span id="progressBadge" class="badge badge-secondary progress-status-badge">空闲</span>
+                        </div>
+                        <div class="flex-fill">
+                            <div class="progress" style="height:12px;">
+                                <div id="progressBar" class="progress-bar" role="progressbar" style="width: 0%;" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
+                            </div>
+                            <div class="d-flex justify-content-between mt-1" style="font-size:0.85rem;color:#6c757d;">
+                                <div id="progressDetail">已接收：0 块</div>
+                                <div id="progressPercent">0%</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <!-- end progress -->
             </form>
             <pre id="result" class="mt-4"></pre>
         </div>
@@ -67,6 +133,81 @@
 </div>
 <script>
 var socket = io({path: '/io'});
+
+let running = false;
+let receivedChunks = 0;
+let matches = 0;
+let progressHideTimeout = null;
+
+function showProgress() {
+    const wrap = document.getElementById('progressWrap');
+    wrap.style.display = 'flex';
+}
+function hideProgress() {
+    const wrap = document.getElementById('progressWrap');
+    wrap.style.display = 'none';
+}
+function setProgressState(state, opts = {}) {
+    // state: 'idle' | 'running' | 'done' | 'cancelled' | 'error'
+    const bar = document.getElementById('progressBar');
+    const badge = document.getElementById('progressBadge');
+    const detail = document.getElementById('progressDetail');
+    const percent = document.getElementById('progressPercent');
+    // matchDisplay 独立，不在 idle 时被重置，按 sendKeyword 重置
+    const matchEl = document.getElementById('matchDisplay');
+
+    if (state === 'idle') {
+        bar.style.width = '0%';
+        bar.className = 'progress-bar';
+        badge.className = 'badge badge-secondary progress-status-badge';
+        badge.textContent = '空闲';
+        detail.textContent = '已接收：0 块';
+        // 不修改 matchEl（保持上一次的匹配统计直至下一次提交）
+        percent.textContent = '0%';
+    } else if (state === 'running') {
+        showProgress();
+        bar.style.width = opts.pct ? (opts.pct + '%') : '5%';
+        bar.className = 'progress-bar progress-bar-striped progress-bar-animated bg-info';
+        badge.className = 'badge badge-info progress-status-badge';
+        badge.textContent = opts.text || '检索中';
+        detail.textContent = `已接收：${receivedChunks} 块`;
+        matchEl.textContent = `匹配：${matches} 条`;
+        percent.textContent = (opts.pct ? opts.pct : 5) + '%';
+    } else if (state === 'done') {
+        bar.style.width = '100%';
+        bar.className = 'progress-bar bg-success';
+        badge.className = 'badge badge-success progress-status-badge';
+        badge.textContent = '完成';
+        detail.textContent = `已接收：${receivedChunks} 块`;
+        matchEl.textContent = `匹配：${matches} 条`;
+        percent.textContent = '100%';
+    } else if (state === 'cancelled') {
+        bar.style.width = '100%';
+        bar.className = 'progress-bar bg-danger';
+        badge.className = 'badge badge-danger progress-status-badge';
+        badge.textContent = '已取消';
+        detail.textContent = `已接收：${receivedChunks} 块`;
+        matchEl.textContent = `匹配：${matches} 条`;
+        percent.textContent = '已取消';
+    } else if (state === 'error') {
+        bar.style.width = '100%';
+        bar.className = 'progress-bar bg-warning';
+        badge.className = 'badge badge-warning progress-status-badge';
+        badge.textContent = '错误';
+        detail.textContent = opts.msg || '出现错误';
+        percent.textContent = '错误';
+    }
+}
+
+function disableControls(val) {
+    document.getElementById('submitBtn').disabled = val;
+    document.getElementById('file').disabled = val;
+    document.getElementById('context_before').disabled = val;
+    document.getElementById('context_after').disabled = val;
+    // cancel should be enabled while running, otherwise disabled
+    document.getElementById('cancelBtn').disabled = !val ? true : false;
+    document.getElementById('exportBtn').disabled = val; // prevent export during running
+}
 
 window.addEventListener('DOMContentLoaded', function(){
     fetch('/files')
@@ -79,13 +220,69 @@ window.addEventListener('DOMContentLoaded', function(){
             sel.appendChild(opt);
         });
     }).catch(() => {});
+    // init progress idle
+    setProgressState('idle');
+    // cancel button initially disabled
+    document.getElementById('cancelBtn').disabled = true;
 });
 
 socket.on('message', data => {
     const text = data.message.replace(/\r?\n/g, '\n');
     /* 静默：不把“??? Cancelled ???”显示到页面 */
-    if (text.includes('??? Cancelled ???')) return;
+    if (text.includes('??? Cancelled ???')) {
+        // reflect cancelled UI
+        running = false;
+        setProgressState('cancelled');
+        disableControls(false);
+        // hide after a short delay (但不重置 matchDisplay)
+        clearTimeout(progressHideTimeout);
+        progressHideTimeout = setTimeout(() => hideProgress(), 1200);
+        return;
+    }
+
+    if (text.includes('Started')) {
+        // server started search
+        running = true;
+        receivedChunks = 0;
+        matches = 0; // reset matches at the start of a new run
+        document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
+        setProgressState('running', {pct:5, text: '开始检索'});
+        disableControls(true);
+        document.getElementById('cancelBtn').disabled = false;
+        return;
+    }
+    if (text.includes('Done')) {
+        // server finished
+        running = false;
+        setProgressState('done');
+        disableControls(false);
+        // hide progress after a short animation but keep matchDisplay unchanged (persist)
+        clearTimeout(progressHideTimeout);
+        progressHideTimeout = setTimeout(() => {
+            hideProgress();
+            // 不调用 setProgressState('idle') 来避免把匹配数重置
+        }, 1200);
+        return;
+    }
+
+    // 非控制消息：显示到结果区并计为一个“块”
     document.getElementById('result').textContent = text + document.getElementById('result').textContent;
+    receivedChunks++;
+    if (!running) {
+        running = true;
+        disableControls(true);
+        document.getElementById('cancelBtn').disabled = false;
+    }
+    let pct = Math.min(95, 5 + Math.floor(receivedChunks * 2));
+    setProgressState('running', {pct: pct, text: `检索中 • ${receivedChunks} 块`});
+});
+
+// 监听后端 progress 事件（包含 matches）
+socket.on('progress', data => {
+    if (!data || typeof data.matches !== 'number') return;
+    matches = data.matches;
+    // 更新 UI 上的匹配数（独占一行）；该数字会被持久显示，直到下一次提交时被重置
+    document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
 });
 
 function sendKeyword() {
@@ -97,19 +294,43 @@ function sendKeyword() {
     const before = parseInt(document.getElementById('context_before').value || '0', 10);
     const after  = parseInt(document.getElementById('context_after').value || '0', 10);
     const file   = document.getElementById('file').value || '';
+
+    // immediately show progress so user gets instant feedback
+    running = true;
+    receivedChunks = 0;
+    matches = 0; // 重置匹配计数：只有新的提交会重置显示
+    document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
+    setProgressState('running', {pct:5, text: '已提交，等待结果...'});
+    disableControls(true);
+    document.getElementById('cancelBtn').disabled = false;
+
     fetch('/search', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({keyword: kw, context_before: before, context_after: after, file})
+    }).catch(err => {
+        // request failed
+        running = false;
+        setProgressState('error', {msg: '提交失败'});
+        disableControls(false);
+        clearTimeout(progressHideTimeout);
+        progressHideTimeout = setTimeout(() => { hideProgress(); }, 1200);
     });
 }
 
 function cancelSearch() {
-    fetch('/cancel', {method: 'POST'});
+    fetch('/cancel', {method: 'POST'}).catch(()=>{});
+    // immediate local feedback; actual cancelled signal may also come from server
+    running = false;
+    setProgressState('cancelled');
+    disableControls(false);
+    clearTimeout(progressHideTimeout);
+    progressHideTimeout = setTimeout(() => { hideProgress(); }, 1200);
 }
 
 function clearResult() {
     document.getElementById('result').textContent = '';
+    // 不重置匹配数：匹配计数应当持久显示直到下一次提交
 }
 
 function exportResult() {
