@@ -14,7 +14,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", path='/io')
 
 # 全局当前正在运行的 ripgrep 进程（read loop 读取这些进程的 stdout）
 proc = None
-# 可能存在的额外进程（例如解压器/解包器），搜索/取消时需要一起清理
+# 可能存在的额外进程（例如解压器/解包器/rg），搜索/取消时需要一起清理
 extra_procs = []
 # 临时目录列表（例如对 archive 的解包目录），结束时需要清理
 temp_dirs = []
@@ -77,6 +77,14 @@ def index():
 
 @app.route('/search', methods=['POST'])
 def search():
+    """
+    改进点（本次提交）：
+    - 在启动搜索前尽量计算要处理的文件总数 total_files（主目录可搜索文件 + 每个压缩文件（1） + 归档内文件数）。
+    - 在解析 ripgrep JSON 流时，监听 'begin' 事件并把 files_done++，实时发送 progress 事件：
+      {files_total, files_done, matches}
+      注意：已移除 'current' 字段以减少带宽与日志量（前端也不再显示当前文件名）。
+    - 保持 match_count 语义：按实际输出的非空结果区块计数（即前端看到多少条内容，matches 与显示一致）。
+    """
     global proc, extra_procs, temp_dirs
     if proc is not None:
         socketio.emit('message', {'message': '?????? Busy ??????\n'})
@@ -116,9 +124,11 @@ def search():
 
     # 将要运行并监听输出的 rg 进程列表（主 rg + 为每个压缩/归档额外启动的 rg）
     all_rg_procs = []
-    # 附加的系统解压/解包进程（解压器、bsdtar/unzip），便于 cancel 清理
+    # 附加的系统解压/解包进程（解压器、bsdtar/unzip/rg），便于 cancel 清理
     extra_procs_local = []
 
+    # 预先计算 total_files（尽量精确）
+    total_files = 0
     try:
         # Helper: 启动 rg 并加入监听列表
         def start_rg_for_path(path, stdin_pipe=None, label=None, exclude_patterns=None):
@@ -141,10 +151,12 @@ def search():
             all_rg_procs.append(rg_proc)
             return rg_proc
 
-        # 如果 user 指定了单个文件并且文件存在：按之前逻辑处理（包括压缩/归档的特殊处理）
+        # If user specified a single existing file -> handle as before
         if file and os.path.isfile(search_path):
             file_lower = file.lower()
             if is_single_file_compressed(file_lower):
+                # single compressed file counts as 1 input file
+                total_files = 1
                 dec_cmd = build_decompress_command(file_lower, search_path)
                 if dec_cmd is None:
                     socketio.emit('message', {'message': f'?? Unsupported compressed format for {file}\n'})
@@ -163,7 +175,7 @@ def search():
                     socketio.emit('message', {'message': f'?? Missing decompressor for {file}: {dec_cmd[0]}\n'})
                     return "Missing decompressor"
                 safe_label = os.path.basename(file)
-                rg_proc = start_rg_for_path('-', stdin_pipe=decompressor_proc.stdout, label=safe_label)
+                start_rg_for_path('-', stdin_pipe=decompressor_proc.stdout, label=safe_label)
             elif is_archive_multi_file(file_lower):
                 # extract to temp dir using python stdlib first, fallback to external extractor
                 temp_dir_for_archive = tempfile.mkdtemp(prefix='rg_archive_')
@@ -214,104 +226,129 @@ def search():
                             pass
                         temp_dirs.remove(temp_dir_for_archive)
                         return "Missing extractor"
-                rg_proc = start_rg_for_path(temp_dir_for_archive)
+                # count files in extracted temp dir
+                cnt = 0
+                for _, _, fns in os.walk(temp_dir_for_archive):
+                    for _ in fns:
+                        cnt += 1
+                total_files = cnt if cnt > 0 else 1
+                start_rg_for_path(temp_dir_for_archive)
             else:
-                rg_proc = start_rg_for_path(search_path)
+                # single normal file: count as 1
+                total_files = 1
+                start_rg_for_path(search_path)
         else:
-            # 搜索一个目录（默认）——需要包括压缩文件与归档
-            # 1) 为主目录启动 rg，但排除识别到的压缩/归档扩展，避免重复或二次读取
-            exclude_patterns = []
-            for ext in SINGLE_COMPRESSED_EXTS + ARCHIVE_EXTS:
-                exclude_patterns.append(f'**/*{ext}')
-            main_rg = start_rg_for_path(search_path, exclude_patterns=exclude_patterns)
-
-            # 2) 遍历目录，找到压缩/归档文件，为每个单独处理（流式或解包后再次 rg）
-            for root, _, files in os.walk(search_path):
-                for fn in files:
+            # Directory search (default) -> want to include compressed files & archives
+            non_excluded_count = 0
+            compressed_files = []
+            archive_files = []
+            # gather files first so we can count precisely
+            for root, _, fns in os.walk(search_path):
+                for fn in fns:
                     full = os.path.join(root, fn)
                     fn_lower = fn.lower()
-                    rel_label = os.path.relpath(full, data_dir)
                     if is_single_file_compressed(fn_lower):
-                        dec_cmd = build_decompress_command(fn_lower, full)
-                        if dec_cmd is None:
-                            # skip unsupported
-                            continue
+                        compressed_files.append(full)
+                    elif is_archive_multi_file(fn_lower):
+                        archive_files.append(full)
+                    else:
+                        non_excluded_count += 1
+            total_files = non_excluded_count + len(compressed_files)
+            # For archives, extract and count files inside (add to total)
+            for full_archive in archive_files:
+                try:
+                    temp_dir_for_archive = tempfile.mkdtemp(prefix='rg_archive_')
+                    temp_dirs.append(temp_dir_for_archive)
+                    extracted_ok = False
+                    try:
+                        import tarfile, zipfile
+                        if full_archive.lower().endswith(('.zip', '.jar', '.war')):
+                            with zipfile.ZipFile(full_archive, 'r') as zf:
+                                safe_extract_zip(zf, temp_dir_for_archive)
+                            extracted_ok = True
+                        else:
+                            with tarfile.open(full_archive, 'r:*') as tf:
+                                safe_extract_tar(tf, temp_dir_for_archive)
+                            extracted_ok = True
+                    except Exception:
+                        extracted_ok = False
+                    if not extracted_ok:
                         try:
-                            decompressor_proc = subprocess.Popen(
-                                dec_cmd,
+                            if full_archive.lower().endswith(('.zip', '.jar', '.war')):
+                                extract_cmd = ['unzip', '-qq', full_archive, '-d', temp_dir_for_archive]
+                            else:
+                                extract_cmd = ['bsdtar', '-xf', full_archive, '-C', temp_dir_for_archive]
+                            extract_proc = subprocess.Popen(
+                                extract_cmd,
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
                                 shell=False,
                                 preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
                             )
-                            extra_procs_local.append(decompressor_proc)
-                            extra_procs.append(decompressor_proc)
-                        except FileNotFoundError:
-                            # decompressor not available -> skip this file
-                            continue
-                        # 启动一个只对 stdin 进行匹配、带 label 的 rg，label 使用相对路径
-                        start_rg_for_path('-', stdin_pipe=decompressor_proc.stdout, label=rel_label)
-                    elif is_archive_multi_file(fn_lower):
-                        # 为 archive 创建临时目录并尝试用 python 解包
-                        temp_dir_for_archive = tempfile.mkdtemp(prefix='rg_archive_')
-                        temp_dirs.append(temp_dir_for_archive)
-                        extracted_ok = False
-                        try:
-                            import tarfile, zipfile
-                            if fn_lower.endswith(('.zip', '.jar', '.war')):
-                                with zipfile.ZipFile(full, 'r') as zf:
-                                    safe_extract_zip(zf, temp_dir_for_archive)
-                                extracted_ok = True
-                            else:
-                                with tarfile.open(full, 'r:*') as tf:
-                                    safe_extract_tar(tf, temp_dir_for_archive)
-                                extracted_ok = True
-                        except Exception:
-                            extracted_ok = False
-                        if not extracted_ok:
-                            try:
-                                if fn_lower.endswith(('.zip', '.jar', '.war')):
-                                    extract_cmd = ['unzip', '-qq', full, '-d', temp_dir_for_archive]
-                                else:
-                                    extract_cmd = ['bsdtar', '-xf', full, '-C', temp_dir_for_archive]
-                                extract_proc = subprocess.Popen(
-                                    extract_cmd,
-                                    stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE,
-                                    shell=False,
-                                    preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
-                                )
-                                extra_procs_local.append(extract_proc)
-                                extra_procs.append(extract_proc)
-                                out, err = extract_proc.communicate()
-                                if extract_proc.returncode != 0:
-                                    try:
-                                        shutil.rmtree(temp_dir_for_archive)
-                                    except Exception:
-                                        pass
-                                    temp_dirs.remove(temp_dir_for_archive)
-                                    continue
-                            except FileNotFoundError:
+                            extra_procs_local.append(extract_proc)
+                            extra_procs.append(extract_proc)
+                            out, err = extract_proc.communicate()
+                            if extract_proc.returncode != 0:
                                 try:
                                     shutil.rmtree(temp_dir_for_archive)
                                 except Exception:
                                     pass
                                 temp_dirs.remove(temp_dir_for_archive)
                                 continue
-                        # 对解包的临时目录启动 rg
-                        start_rg_for_path(temp_dir_for_archive)
-                    else:
-                        # 非压缩/非归档文件，主 rg 已覆盖
-                        continue
+                        except FileNotFoundError:
+                            try:
+                                shutil.rmtree(temp_dir_for_archive)
+                            except Exception:
+                                pass
+                            temp_dirs.remove(temp_dir_for_archive)
+                            continue
+                    # count files inside this extracted archive
+                    cnt = 0
+                    for _, _, fns in os.walk(temp_dir_for_archive):
+                        for _ in fns:
+                            cnt += 1
+                    total_files += cnt if cnt > 0 else 1
+                    # and start rg on extracted dir
+                    start_rg_for_path(temp_dir_for_archive)
+                except Exception:
+                    # skip problematic archive
+                    continue
+            # start main rg for non-compressed files, excluding compressed/archives to avoid duplicates
+            exclude_patterns = []
+            for ext in SINGLE_COMPRESSED_EXTS + ARCHIVE_EXTS:
+                exclude_patterns.append(f'**/*{ext}')
+            # only start main rg if there are non-excluded files or to ensure directory traversal by rg
+            start_rg_for_path(search_path, exclude_patterns=exclude_patterns)
 
-        # 如果没有任何 rg 进程启动则报错
+            # start rg for each compressed file (streamed)
+            for full in compressed_files:
+                fn = os.path.basename(full)
+                fn_lower = fn.lower()
+                dec_cmd = build_decompress_command(fn_lower, full)
+                if dec_cmd is None:
+                    continue
+                try:
+                    decompressor_proc = subprocess.Popen(
+                        dec_cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        shell=False,
+                        preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                    )
+                    extra_procs_local.append(decompressor_proc)
+                    extra_procs.append(decompressor_proc)
+                except FileNotFoundError:
+                    continue
+                rel_label = os.path.relpath(full, data_dir)
+                start_rg_for_path('-', stdin_pipe=decompressor_proc.stdout, label=rel_label)
+
+        # If no rg started, error
         if not all_rg_procs:
             socketio.emit('message', {'message': '?? No searchable files or rg failed to start\n'})
             return "No search procs"
 
         # 统一监听这些 rg 进程的 stdout：使用队列 + 每个进程独立线程转发 stdout -> 队列
         q = queue.Queue()
-        proc_eof = set()
         total_procs = len(all_rg_procs)
 
         def forward_stdout(p):
@@ -330,7 +367,6 @@ def search():
         for p in all_rg_procs:
             t = threading.Thread(target=forward_stdout, args=(p,), daemon=True)
             t.start()
-            # 加入 extra_procs 以便 cancel 时一并 kill（只包含外部解压/解包/rg）
             extra_procs_local.append(p)
             extra_procs.append(p)
 
@@ -365,6 +401,7 @@ def search():
         output_buffers[keyword] = buf
         # match_count 现在按实际输出的“内容区块”计数，保证与页面显示一致
         match_count = 0
+        files_done = 0
         try:
             import json
             with app.app_context():
@@ -376,8 +413,8 @@ def search():
                 block_ready = False
                 first_block = True
 
-                # 发送初始匹配数（0）
-                socketio.emit('progress', {'matches': match_count})
+                # 发送初始匹配数和总文件数（files_total）
+                socketio.emit('progress', {'matches': match_count, 'files_total': total_files, 'files_done': files_done})
 
                 # loop: 从队列中读取行，直到所有 rg 进程发出 EOF 标记
                 eof_set = set()
@@ -419,7 +456,17 @@ def search():
                         continue
 
                     typ = obj.get('type')
+                    # handle 'begin' to update files_done
                     if typ == 'begin':
+                        # increment files_done when a new file begins
+                        files_done += 1
+                        # send progress update with files_done (removed 'current' field)
+                        socketio.emit('progress', {
+                            'matches': match_count,
+                            'files_total': total_files,
+                            'files_done': files_done
+                        })
+                        # reset local buffers for this file
                         before_lines = []
                         after_lines = []
                         block_main = None
@@ -441,7 +488,6 @@ def search():
                         block_main = line_text
                         after_lines = []
                         block_ready = True
-                        # 注意：不在这里递增 match_count（因为尚未输出区块）
                     elif typ == 'end':
                         before_lines = []
                         after_lines = []
@@ -457,22 +503,24 @@ def search():
                         for i in range(context_after_n):
                             block.append(after_lines[i] if i < len(after_lines) else '')
                         out_block = '\n'.join(block)
-                        # 如果 out_block 非空白，则才视为一条有效显示结果并计数
+                        # 只有非空区块计为匹配并输出
                         if out_block.strip():
                             if not first_block:
                                 buf.append('')
                                 socketio.emit('message', {'message': '\n'})
                             buf.append(out_block)
                             socketio.emit('message', {'message': out_block + '\n'})
-                            # 输出即为实际显示的一条结果块，递增计数并发送进度更新
                             match_count += 1
-                            socketio.emit('progress', {'matches': match_count})
+                            socketio.emit('progress', {
+                                'matches': match_count,
+                                'files_total': total_files,
+                                'files_done': files_done
+                            })
                             first_block = False
                         else:
-                            # 纯空白块（可能全部为上下文空行），只发一个换行到前端但不计为匹配
+                            # 纯空白块：把换行发给前端但不计为匹配
                             socketio.emit('message', {'message': '\n'})
                         block_ready = False
-                        # 把命中行也作为下一块的上文
                         before_lines.append(block_main)
                         if len(before_lines) > context_before_n:
                             before_lines.pop(0)
@@ -495,7 +543,11 @@ def search():
                         buf.append(out_block)
                         socketio.emit('message', {'message': out_block + '\n'})
                         match_count += 1
-                        socketio.emit('progress', {'matches': match_count})
+                        socketio.emit('progress', {
+                            'matches': match_count,
+                            'files_total': total_files,
+                            'files_done': files_done
+                        })
                     else:
                         socketio.emit('message', {'message': '\n'})
         except Exception:
@@ -547,7 +599,7 @@ def search():
             proc = None
 
             # 发送最终匹配数一次，确保前端能收到最终值
-            socketio.emit('progress', {'matches': match_count})
+            socketio.emit('progress', {'matches': match_count, 'files_total': total_files, 'files_done': files_done})
 
             # 尝试保存导出
             try:
@@ -562,7 +614,9 @@ def search():
     # 启动后台读写线程
     thread = threading.Thread(target=get_output_loop, daemon=True)
     thread.start()
+    # 立即通知前端搜索启动（前端会显示进度条）并发送初始 total_files
     socketio.emit('message', {'message': '?????? Started ??????\n'})
+    socketio.emit('progress', {'files_total': total_files, 'files_done': 0, 'matches': 0})
     return "Started"
 
 
