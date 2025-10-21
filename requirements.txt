@@ -6,3 +6,5 @@ gevent-websocket
 py7zr
 rarfile
 lz4
+xlrd
+openpyxl
