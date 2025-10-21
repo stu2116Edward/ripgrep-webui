@@ -30,6 +30,14 @@ ARCHIVE_EXTS = (
     '.7z', '.rar'   # 支持 .7z / .rar
 )
 
+# 支持的电子表格后缀
+EXCEL_EXTS = ('.xls', '.xlsx')
+
+# 缓存 ripgrep 是否支持 --label 参数（None 表示尚未检测）
+_RG_SUPPORTS_LABEL = None
+# 进程 pid -> 自定义 label 映射（当 rg 不支持 --label 时使用）
+_proc_label_map = {}
+
 
 def is_single_file_compressed(filename_lower):
     return filename_lower.endswith(SINGLE_COMPRESSED_EXTS)
@@ -39,9 +47,27 @@ def is_archive_multi_file(filename_lower):
     return filename_lower.endswith(ARCHIVE_EXTS)
 
 
+def is_excel_file(filename_lower):
+    return filename_lower.endswith(EXCEL_EXTS)
+
+
 def has_cmd(name):
-    """Check if external command exists in PATH."""
+    """检查外部命令是否在 PATH 中"""
     return shutil.which(name) is not None
+
+
+def check_rg_supports_label():
+    """检测系统中 rg 的帮助输出里是否包含 --label，缓存结果"""
+    global _RG_SUPPORTS_LABEL
+    if _RG_SUPPORTS_LABEL is not None:
+        return _RG_SUPPORTS_LABEL
+    try:
+        p = subprocess.run(['rg', '--help'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+        out = p.stdout.decode('utf-8', errors='replace')
+        _RG_SUPPORTS_LABEL = ('--label' in out)
+    except Exception:
+        _RG_SUPPORTS_LABEL = False
+    return _RG_SUPPORTS_LABEL
 
 
 def try_py7zr_extract(archive_path, dest):
@@ -74,9 +100,8 @@ def try_rarfile_extract(archive_path, dest):
 
 def start_rg_and_feed_python_stream(rg_cmd, feed_fn):
     """
-    Start rg process with stdin=PIPE and run feed_fn(writer) in a thread to write decompressed bytes.
-    feed_fn should accept a single argument: a writable binary file-like (rg_proc.stdin).
-    Returns the rg process.
+    启动 rg 进程并用 feed_fn 向其 stdin 写入解压或转换后的内容
+    feed_fn 接受一个可写二进制文件对象
     """
     rg_proc = subprocess.Popen(
         rg_cmd,
@@ -103,7 +128,7 @@ def start_rg_and_feed_python_stream(rg_cmd, feed_fn):
 
 
 def python_decompress_feed(path, ext, out_stream):
-    """Feed decompressed bytes to out_stream (binary write). Supports gzip,bz2,lzma and tries lz4 if available."""
+    """解压单一压缩文件并写入到 out_stream（支持gzip,bz2,lzma,lz4）"""
     ext = ext.lower()
     try:
         if ext.endswith('.gz'):
@@ -119,7 +144,6 @@ def python_decompress_feed(path, ext, out_stream):
             with lzma.open(path, 'rb') as f:
                 shutil.copyfileobj(f, out_stream)
         elif ext.endswith('.lz4'):
-            # try python lz4.frame
             try:
                 import lz4.frame as lz4frame
                 with open(path, 'rb') as raw:
@@ -132,13 +156,10 @@ def python_decompress_feed(path, ext, out_stream):
                         if out:
                             out_stream.write(out)
             except Exception:
-                # fallback: no python lz4 -> raise so caller can try external tool
                 raise
         else:
-            # unknown extension
             raise RuntimeError("Unsupported python decompressor for ext: " + ext)
     except Exception:
-        # re-raise to caller to handle fallback
         raise
 
 
@@ -148,7 +169,7 @@ def build_decompress_command(path_lower, real_path):
         if has_cmd('gzip'):
             return ['gzip', '-dc', real_path]
         else:
-            return None  # allow python fallback
+            return None
     if path_lower.endswith('.bz2'):
         if has_cmd('bzip2'):
             return ['bzip2', '-dc', real_path]
@@ -169,11 +190,9 @@ def build_decompress_command(path_lower, real_path):
             return ['lzma', '-dc', real_path]
         else:
             return None
-    # for 7z/rar try 7z if available (7z -so)
     if path_lower.endswith(('.7z', '.rar')):
         if has_cmd('7z'):
             return ['7z', 'x', '-so', real_path]
-        # fallthrough to python-based handling (py7zr/rarfile) in archive extraction path
     return None
 
 
@@ -199,6 +218,84 @@ def safe_extract_zip(zipf, path):
     zipf.extractall(path)
 
 
+def stream_excel_to_writer(path, out_stream):
+    path_lower = path.lower()
+    try:
+        if path_lower.endswith('.xlsx'):
+            try:
+                import openpyxl
+            except Exception:
+                socketio.emit('message', {'message': f'?? openpyxl not installed, cannot parse xlsx: {os.path.basename(path)}\n'})
+                return
+            # 以只读模式打开，data_only=True 获取公式计算值（若存在）
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            for sheet in wb:
+                try:
+                    out_stream.write((f"# sheet: {sheet.title}\n").encode('utf-8'))
+                except Exception:
+                    pass
+                # iter_rows(values_only=True) 返回每行的值元组
+                for row in sheet.iter_rows(values_only=True):
+                    try:
+                        vals = []
+                        for v in row:
+                            if v is None:
+                                vals.append('')
+                            else:
+                                vals.append(str(v))
+                        line = '\t'.join(vals) + '\n'
+                        out_stream.write(line.encode('utf-8'))
+                    except Exception:
+                        # 某些单元格可能编码成问题，使用 replace 处理
+                        try:
+                            safe_vals = [str(v) if v is not None else '' for v in row]
+                            line = '\t'.join(safe_vals) + '\n'
+                            out_stream.write(line.encode('utf-8', errors='replace'))
+                        except Exception:
+                            continue
+            try:
+                wb.close()
+            except Exception:
+                pass
+
+        elif path_lower.endswith('.xls'):
+            try:
+                import xlrd
+            except Exception:
+                socketio.emit('message', {'message': f'?? xlrd not installed, cannot parse xls: {os.path.basename(path)}\n'})
+                return
+            wb = xlrd.open_workbook(path, on_demand=True)
+            for si in range(wb.nsheets):
+                sheet = wb.sheet_by_index(si)
+                try:
+                    out_stream.write((f"# sheet: {sheet.name}\n").encode('utf-8'))
+                except Exception:
+                    pass
+                for r in range(sheet.nrows):
+                    try:
+                        row = sheet.row_values(r)
+                        vals = [(str(c) if c is not None else '') for c in row]
+                        line = '\t'.join(vals) + '\n'
+                        out_stream.write(line.encode('utf-8'))
+                    except Exception:
+                        try:
+                            out_stream.write(('\t'.join([str(c) for c in sheet.row_values(r)]) + '\n').encode('utf-8', errors='replace'))
+                        except Exception:
+                            continue
+            try:
+                wb.release_resources()
+            except Exception:
+                pass
+        else:
+            # 非支持格式
+            socketio.emit('message', {'message': f'?? Unsupported excel format: {path}\n'})
+            return
+    except Exception as e:
+        socketio.emit('message', {'message': f'?? Excel parse failed for {os.path.basename(path)}: {e}\n'})
+        return
+# ===== 结束 Excel 转换函数 =====
+
+
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -206,7 +303,7 @@ def index():
 
 @app.route('/search', methods=['POST'])
 def search():
-    global proc, extra_procs, temp_dirs
+    global proc, extra_procs, temp_dirs, _proc_label_map
     if proc is not None:
         socketio.emit('message', {'message': '?????? Busy ??????\n'})
         return "Busy"
@@ -228,7 +325,7 @@ def search():
     if context_after and context_after > 0:
         rg_base += ['-A', str(context_after)]
 
-    # 默认搜索路径：优先 /data，如果不存在就使用项目目录（保证“所有文件”能工作）
+    # 默认搜索路径：优先 /data，如果不存在就使用项目目录
     data_dir = '/data'
     if not os.path.isdir(data_dir):
         data_dir = os.path.dirname(__file__)
@@ -253,17 +350,26 @@ def search():
     try:
         # Helper: 启动 rg 并加入监听列表
         def start_rg_for_path(path, stdin_pipe=None, label=None, exclude_patterns=None, python_stream_feed=None):
+            """
+            启动 rg 以搜索 path 或从 stdin（使用 '-'）读取内容。
+            当系统的 rg 不支持 --label 时，仍然接受 label 参数并把 label 存入 _proc_label_map 供后续使用。
+            """
             cmd = rg_base.copy()
             if exclude_patterns:
                 for pat in exclude_patterns:
                     cmd += ['--glob', f'!{pat}']
-            if label:
-                cmd += ['--label', label, '--', keyword, '-']
+            supports_label = check_rg_supports_label()
+            if label and supports_label:
+                # rg 支持 --label：把 label 传给 rg（此时 rg 会在 JSON 的 begin/path 中显示 label）
+                cmd += ['--label', label, '--', keyword, '-'] if path == '-' else ['--label', label, '--', keyword, path]
             else:
-                cmd += ['--', keyword, path]
+                # rg 不支持 --label：不传此参数，仍用 stdin 或 path 搜索
+                if path == '-':
+                    cmd += ['--', keyword, '-']
+                else:
+                    cmd += ['--', keyword, path]
 
             if python_stream_feed:
-                # start rg and feed using python
                 rg_proc = start_rg_and_feed_python_stream(cmd, python_stream_feed)
             else:
                 rg_proc = subprocess.Popen(
@@ -274,13 +380,95 @@ def search():
                     shell=False,
                     preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
                 )
+
+            # 如果 rg 不支持 --label 且用户希望有 label，保存映射以便后续在解析时使用
+            if label and not supports_label:
+                try:
+                    pid = rg_proc.pid
+                    if pid is not None:
+                        _proc_label_map[pid] = label
+                except Exception:
+                    pass
+
             all_rg_procs.append(rg_proc)
             return rg_proc
 
         # If user specified a single existing file -> handle as before but with python fallbacks
         if file and os.path.isfile(search_path):
             file_lower = file.lower()
-            if is_single_file_compressed(file_lower):
+
+            # === 支持 Excel 文件（xls/xlsx）直接流式检索 ===
+            if is_excel_file(file_lower):
+                total_files = 1
+                safe_label = os.path.basename(file)
+                # 使用 python 库将 excel 转为文本流并传给 rg
+                def feed_fn(w, p=search_path):
+                    stream_excel_to_writer(p, w)
+
+                # 启动 rg（从 stdin 读取）
+                try:
+                    start_rg_for_path('-', label=safe_label, python_stream_feed=feed_fn)
+                except Exception as e:
+                    socketio.emit('message', {'message': f'?? Failed to start rg for excel: {e}\n'})
+                    return "Excel stream failed"
+
+            # === 直接流式处理 tar.gz/tgz ===
+            elif file_lower.endswith('.tar.gz') or file_lower.endswith('.tgz'):
+                # 直接流式处理 tar.gz 归档内容，无需落盘；为每个归档内文件启动一个 rg（stdin）
+                try:
+                    import tarfile
+                    total_files = 0
+                    with tarfile.open(search_path, mode='r:gz') as tar:
+                        for member in tar.getmembers():
+                            if member.isfile():
+                                total_files += 1
+                                f = tar.extractfile(member)
+                                if f:
+                                    label = f"{os.path.basename(file)}/{member.name}"
+                                    cmd = rg_base.copy()
+                                    supports_label = check_rg_supports_label()
+                                    if supports_label:
+                                        cmd += ['--label', label, '--', keyword, '-']
+                                    else:
+                                        cmd += ['--', keyword, '-']
+                                    # 启动 rg 并把归档内文件内容写入其 stdin
+                                    try:
+                                        rg_proc = subprocess.Popen(
+                                            cmd,
+                                            stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT,
+                                            shell=False,
+                                            preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                                        )
+                                        extra_procs_local.append(rg_proc)
+                                        all_rg_procs.append(rg_proc)
+                                        if not supports_label:
+                                            try:
+                                                _proc_label_map[rg_proc.pid] = label
+                                            except Exception:
+                                                pass
+                                        # 将文件流写入 rg stdin（阻塞写入是可以的，因为这是独立进程）
+                                        try:
+                                            shutil.copyfileobj(f, rg_proc.stdin)
+                                        except Exception:
+                                            pass
+                                        try:
+                                            rg_proc.stdin.close()
+                                        except Exception:
+                                            pass
+                                    except Exception:
+                                        # 如果启动 rg 失败，跳过该文件
+                                        continue
+                    # 如果归档为空，仍要保证至少一个进程以触发“无结果”逻辑
+                    if total_files == 0:
+                        total_files = 1
+                        start_rg_for_path(search_path)
+                except Exception as e:
+                    socketio.emit('message', {'message': f'?? Tar.gz stream failed: {e}\n'})
+                    return "Tar.gz stream failed"
+
+            elif is_single_file_compressed(file_lower):
                 # single compressed file counts as 1 input file
                 total_files = 1
                 # Prefer external command if available, else use python streaming
@@ -372,7 +560,6 @@ def search():
                             temp_dirs.remove(temp_dir_for_archive)
                             return "Extraction failed"
                     except FileNotFoundError:
-                        # no extractor available -> inform user but continue gracefully (skip this archive)
                         socketio.emit('message', {'message': f'?? Missing extractor on system for archive: {file}\n'})
                         try:
                             shutil.rmtree(temp_dir_for_archive)
@@ -394,10 +581,11 @@ def search():
                 total_files = 1
                 start_rg_for_path(search_path)
         else:
-            # Directory search (default) -> include compressed and archives
+            # Directory search (default) -> include compressed, archives and excel
             non_excluded_count = 0
             compressed_files = []
             archive_files = []
+            excel_files = []
             # gather files first so we can count precisely
             for root, _, fns in os.walk(search_path):
                 for fn in fns:
@@ -407,9 +595,11 @@ def search():
                         compressed_files.append(full)
                     elif is_archive_multi_file(fn_lower):
                         archive_files.append(full)
+                    elif is_excel_file(fn_lower):
+                        excel_files.append(full)
                     else:
                         non_excluded_count += 1
-            total_files = non_excluded_count + len(compressed_files)
+            total_files = non_excluded_count + len(compressed_files) + len(excel_files)
             # For archives, extract and count files inside (add to total). Use py7zr/rarfile if available, else external
             for full_archive in archive_files:
                 try:
@@ -472,21 +662,18 @@ def search():
                                 pass
                             temp_dirs.remove(temp_dir_for_archive)
                             continue
-                    # count files inside this extracted archive
                     cnt = 0
                     for _, _, fns in os.walk(temp_dir_for_archive):
                         for _ in fns:
                             cnt += 1
                     total_files += cnt if cnt > 0 else 1
-                    # and start rg on extracted dir
                     start_rg_for_path(temp_dir_for_archive)
                 except Exception:
-                    # skip problematic archive
                     continue
 
-            # start main rg for non-compressed files, excluding compressed/archives to avoid duplicates
+            # start main rg for non-compressed files, excluding compressed/archives/excel to avoid duplicates
             exclude_patterns = []
-            for ext in SINGLE_COMPRESSED_EXTS + ARCHIVE_EXTS:
+            for ext in SINGLE_COMPRESSED_EXTS + ARCHIVE_EXTS + EXCEL_EXTS:
                 exclude_patterns.append(f'**/*{ext}')
             start_rg_for_path(search_path, exclude_patterns=exclude_patterns)
 
@@ -509,19 +696,28 @@ def search():
                         extra_procs.append(decompressor_proc)
                         start_rg_for_path('-', stdin_pipe=decompressor_proc.stdout, label=rel_label)
                     except FileNotFoundError:
-                        # fallback to python feed
                         def feed_fn(w, p=full, e=fn_lower):
                             python_decompress_feed(p, e, w)
                         start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
                 else:
-                    # try python feed
                     def feed_fn(w, p=full, e=fn_lower):
                         python_decompress_feed(p, e, w)
                     try:
                         start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
                     except Exception:
-                        # if python feed fails, skip
                         continue
+
+            # 新增：对每个 excel 文件做流式转换并交给 rg（不落盘）
+            for full in excel_files:
+                fn = os.path.basename(full)
+                rel_label = os.path.relpath(full, data_dir)
+                # python feed：把 excel 转为文本写入 rg stdin
+                def feed_fn(w, p=full):
+                    stream_excel_to_writer(p, w)
+                try:
+                    start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                except Exception:
+                    continue
 
         # If no rg started, error
         if not all_rg_procs:
@@ -573,10 +769,9 @@ def search():
         proc = None
         return "Error"
 
-    
     # 读取与解析合并后的流（从队列读取）
     def get_output_loop():
-        global proc, extra_procs, temp_dirs
+        global proc, extra_procs, temp_dirs, _proc_label_map
         buf = []
         output_buffers[keyword] = buf
         # match_count 现在按实际输出的“内容区块”计数，保证与页面显示一致
@@ -631,6 +826,10 @@ def search():
                     except Exception:
                         raw_text = line.strip()
                         if raw_text:
+                            # 如果 rg 不支持 --label，我们可以在这里用 pid->label 映射补上显示（简单前缀）
+                            label = _proc_label_map.get(owner)
+                            if label:
+                                raw_text = f"[{label}] {raw_text}"
                             buf.append(raw_text)
                             socketio.emit('message', {'message': raw_text + '\n'})
                         continue
@@ -638,6 +837,12 @@ def search():
                     typ = obj.get('type')
                     # handle 'begin' to update files_done
                     if typ == 'begin':
+                        # 如果 rg 不支持 --label，则尝试注入 label 到 obj 的 path 字段（仅本地使用）
+                        if 'data' in obj and 'path' not in obj.get('data', {}) and owner in _proc_label_map:
+                            try:
+                                obj['data']['path'] = {'text': _proc_label_map.get(owner)}
+                            except Exception:
+                                pass
                         # increment files_done when a new file begins
                         files_done += 1
                         # send progress update with files_done (no 'current' field)
@@ -688,6 +893,10 @@ def search():
                             if not first_block:
                                 buf.append('')
                                 socketio.emit('message', {'message': '\n'})
+                            # 如果 rg 不支持 --label，则在输出前用 proc map 补上文件标签（否则 rg 本身会在 json 中带 label）
+                            label = _proc_label_map.get(owner)
+                            if label:
+                                out_block = f"[{label}]\n" + out_block
                             buf.append(out_block)
                             socketio.emit('message', {'message': out_block + '\n'})
                             match_count += 1
@@ -720,6 +929,9 @@ def search():
                         if not first_block:
                             buf.append('')
                             socketio.emit('message', {'message': '\n'})
+                        label = _proc_label_map.get(owner)
+                        if label:
+                            out_block = f"[{label}]\n" + out_block
                         buf.append(out_block)
                         socketio.emit('message', {'message': out_block + '\n'})
                         match_count += 1
@@ -738,6 +950,10 @@ def search():
                         if p and p.stdout:
                             for raw in p.stdout:
                                 text = raw.decode('utf-8', errors='replace')
+                                # 补上 label（如果有）
+                                label = _proc_label_map.get(getattr(p, 'pid', None))
+                                if label:
+                                    text = f"[{label}] {text}"
                                 buf.append(text)
                                 socketio.emit('message', {'message': text})
                 except Exception:
@@ -774,6 +990,9 @@ def search():
                 except Exception:
                     pass
             temp_dirs = []
+
+            # 清理 pid->label 映射（避免内存泄漏）
+            _proc_label_map = {}
 
             # 置空全局 proc（注意：proc 可能是第一个 rg）
             proc = None
