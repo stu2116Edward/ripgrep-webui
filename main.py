@@ -218,7 +218,15 @@ def safe_extract_zip(zipf, path):
     zipf.extractall(path)
 
 
+# ===== 将 Excel 文件转换为纯文本流，写入 out_stream（binary writer） =====
 def stream_excel_to_writer(path, out_stream):
+    """
+    将 xls/xlsx 文件内容以文本形式写到 out_stream（二进制写）。
+    输出格式（便于 ripgrep 搜索）：
+      # sheet: <sheetname>
+      <cell1>\t<cell2>\t... \n
+    优先使用 Python 库 openpyxl（xlsx）和 xlrd（xls）。若缺失，会尝试通知前端并跳过该文件。
+    """
     path_lower = path.lower()
     try:
         if path_lower.endswith('.xlsx'):
@@ -468,113 +476,229 @@ def search():
                     socketio.emit('message', {'message': f'?? Tar.gz stream failed: {e}\n'})
                     return "Tar.gz stream failed"
 
-            elif is_single_file_compressed(file_lower):
-                # single compressed file counts as 1 input file
-                total_files = 1
-                # Prefer external command if available, else use python streaming
-                dec_cmd = build_decompress_command(file_lower, search_path)
-                safe_label = os.path.basename(file)
-                if dec_cmd:
-                    try:
-                        decompressor_proc = subprocess.Popen(
-                            dec_cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            shell=False,
-                            preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
-                        )
-                        extra_procs_local.append(decompressor_proc)
-                        extra_procs.append(decompressor_proc)
-                        start_rg_for_path('-', stdin_pipe=decompressor_proc.stdout, label=safe_label)
-                    except FileNotFoundError:
-                        # fallback to python stream
-                        def feed_fn(w):
-                            python_decompress_feed(search_path, file_lower, w)
-                        start_rg_for_path('-', label=safe_label, python_stream_feed=feed_fn)
-                else:
-                    # python decompressor path
-                    def feed_fn(w):
-                        python_decompress_feed(search_path, file_lower, w)
-                    start_rg_for_path('-', label=safe_label, python_stream_feed=feed_fn)
-
+            # 直接流式处理 zip/rar/7z 等归档（无外部 extractor 情况下的回退） ===
             elif is_archive_multi_file(file_lower):
-                # extract to temp dir using python stdlib first, fallback to py7zr/rarfile, then external tools
-                temp_dir_for_archive = tempfile.mkdtemp(prefix='rg_archive_')
-                temp_dirs.append(temp_dir_for_archive)
-                extracted_ok = False
-                # try python stdlib zip/tar
+                # 优先尝试 python 库的“逐文件流式读取并喂入 rg”方式，避免依赖外部 extractor
+                streamed = False
                 try:
-                    import tarfile, zipfile
+                    # zip
                     if file_lower.endswith(('.zip', '.jar', '.war')):
+                        import zipfile
                         with zipfile.ZipFile(search_path, 'r') as zf:
-                            safe_extract_zip(zf, temp_dir_for_archive)
-                        extracted_ok = True
-                    else:
-                        with tarfile.open(search_path, 'r:*') as tf:
-                            safe_extract_tar(tf, temp_dir_for_archive)
-                        extracted_ok = True
-                except Exception:
-                    extracted_ok = False
-
-                # try py7zr for 7z, and rarfile for rar
-                if not extracted_ok:
-                    if file_lower.endswith('.7z'):
-                        ok, msg = try_py7zr_extract(search_path, temp_dir_for_archive)
-                        if ok:
-                            extracted_ok = True
+                            members = zf.namelist()
+                            total_files = 0
+                            for name in members:
+                                # 跳过目录
+                                if name.endswith('/'):
+                                    continue
+                                total_files += 1
+                                label = f"{os.path.basename(file)}/{name}"
+                                supports_label = check_rg_supports_label()
+                                if supports_label:
+                                    cmd = rg_base.copy() + ['--label', label, '--', keyword, '-']
+                                else:
+                                    cmd = rg_base.copy() + ['--', keyword, '-']
+                                try:
+                                    rg_proc = subprocess.Popen(
+                                        cmd,
+                                        stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT,
+                                        shell=False,
+                                        preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                                    )
+                                    extra_procs_local.append(rg_proc)
+                                    all_rg_procs.append(rg_proc)
+                                    if not supports_label:
+                                        try:
+                                            _proc_label_map[rg_proc.pid] = label
+                                        except Exception:
+                                            pass
+                                    with zf.open(name, 'r') as member_f:
+                                        try:
+                                            shutil.copyfileobj(member_f, rg_proc.stdin)
+                                        except Exception:
+                                            pass
+                                    try:
+                                        rg_proc.stdin.close()
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    continue
+                            streamed = True
+                    # rar
                     elif file_lower.endswith('.rar'):
-                        ok, msg = try_rarfile_extract(search_path, temp_dir_for_archive)
-                        if ok:
-                            extracted_ok = True
+                        try:
+                            import rarfile
+                            rf = rarfile.RarFile(search_path)
+                            members = rf.infolist()
+                            total_files = 0
+                            for mi in members:
+                                if mi.isdir():
+                                    continue
+                                total_files += 1
+                                name = mi.filename
+                                label = f"{os.path.basename(file)}/{name}"
+                                supports_label = check_rg_supports_label()
+                                if supports_label:
+                                    cmd = rg_base.copy() + ['--label', label, '--', keyword, '-']
+                                else:
+                                    cmd = rg_base.copy() + ['--', keyword, '-']
+                                try:
+                                    rg_proc = subprocess.Popen(
+                                        cmd,
+                                        stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT,
+                                        shell=False,
+                                        preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                                    )
+                                    extra_procs_local.append(rg_proc)
+                                    all_rg_procs.append(rg_proc)
+                                    if not supports_label:
+                                        try:
+                                            _proc_label_map[rg_proc.pid] = label
+                                        except Exception:
+                                            pass
+                                    with rf.open(mi) as member_f:
+                                        try:
+                                            shutil.copyfileobj(member_f, rg_proc.stdin)
+                                        except Exception:
+                                            pass
+                                    try:
+                                        rg_proc.stdin.close()
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    continue
+                            streamed = True
+                        except Exception:
+                            streamed = False
+                    # 7z via py7zr (py7zr.readall 或 .read 遍历)
+                    elif file_lower.endswith('.7z'):
+                        try:
+                            import py7zr
+                            with py7zr.SevenZipFile(search_path, mode='r') as z:
+                                d = z.readall()  # dict: name -> bytes
+                                total_files = 0
+                                for name, b in d.items():
+                                    if not name:
+                                        continue
+                                    total_files += 1
+                                    label = f"{os.path.basename(file)}/{name}"
+                                    supports_label = check_rg_supports_label()
+                                    if supports_label:
+                                        cmd = rg_base.copy() + ['--label', label, '--', keyword, '-']
+                                    else:
+                                        cmd = rg_base.copy() + ['--', keyword, '-']
+                                    try:
+                                        rg_proc = subprocess.Popen(
+                                            cmd,
+                                            stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT,
+                                            shell=False,
+                                            preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                                        )
+                                        extra_procs_local.append(rg_proc)
+                                        all_rg_procs.append(rg_proc)
+                                        if not supports_label:
+                                            try:
+                                                _proc_label_map[rg_proc.pid] = label
+                                            except Exception:
+                                                pass
+                                        bio = io.BytesIO(b)
+                                        try:
+                                            shutil.copyfileobj(bio, rg_proc.stdin)
+                                        except Exception:
+                                            pass
+                                        try:
+                                            rg_proc.stdin.close()
+                                        except Exception:
+                                            pass
+                                    except Exception:
+                                        continue
+                            streamed = True
+                        except Exception:
+                            streamed = False
+                except Exception:
+                    streamed = False
 
-                if not extracted_ok:
-                    # fallback to external extractor: unzip / 7z / bsdtar
+                if not streamed:
+                    # 若 python 库流式处理失败，再退回到原来的“解包到临时目录”的策略（如有 unzip/7z/bsdtar）
+                    temp_dir_for_archive = tempfile.mkdtemp(prefix='rg_archive_')
+                    temp_dirs.append(temp_dir_for_archive)
+                    extracted_ok = False
                     try:
+                        import tarfile, zipfile
                         if file_lower.endswith(('.zip', '.jar', '.war')):
-                            extract_cmd = ['unzip', '-qq', search_path, '-d', temp_dir_for_archive]
-                        elif file_lower.endswith(('.7z', '.rar')):
-                            # use 7z if available
-                            if has_cmd('7z'):
-                                extract_cmd = ['7z', 'x', '-y', search_path, f'-o{temp_dir_for_archive}']
-                            else:
-                                raise FileNotFoundError('7z not available')
+                            with zipfile.ZipFile(search_path, 'r') as zf:
+                                safe_extract_zip(zf, temp_dir_for_archive)
+                            extracted_ok = True
                         else:
-                            extract_cmd = ['bsdtar', '-xf', search_path, '-C', temp_dir_for_archive]
-                        extract_proc = subprocess.Popen(
-                            extract_cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            shell=False,
-                            preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
-                        )
-                        extra_procs_local.append(extract_proc)
-                        extra_procs.append(extract_proc)
-                        out, err = extract_proc.communicate()
-                        if extract_proc.returncode != 0:
-                            msg = err.decode('utf-8', errors='replace') if err else 'Unknown extraction error'
-                            socketio.emit('message', {'message': f'?? Extraction failed: {msg}\n'})
+                            # tar/other handled by tarfile
+                            with tarfile.open(search_path, 'r:*') as tf:
+                                safe_extract_tar(tf, temp_dir_for_archive)
+                            extracted_ok = True
+                    except Exception:
+                        extracted_ok = False
+
+                    if not extracted_ok:
+                        if file_lower.endswith('.7z'):
+                            ok, msg = try_py7zr_extract(search_path, temp_dir_for_archive)
+                            if ok:
+                                extracted_ok = True
+                        elif file_lower.endswith('.rar'):
+                            ok, msg = try_rarfile_extract(search_path, temp_dir_for_archive)
+                            if ok:
+                                extracted_ok = True
+
+                    if not extracted_ok:
+                        try:
+                            if file_lower.endswith(('.zip', '.jar', '.war')):
+                                extract_cmd = ['unzip', '-qq', search_path, '-d', temp_dir_for_archive]
+                            elif file_lower.endswith(('.7z', '.rar')):
+                                if has_cmd('7z'):
+                                    extract_cmd = ['7z', 'x', '-y', search_path, f'-o{temp_dir_for_archive}']
+                                else:
+                                    raise FileNotFoundError('7z not available')
+                            else:
+                                extract_cmd = ['bsdtar', '-xf', search_path, '-C', temp_dir_for_archive]
+                            extract_proc = subprocess.Popen(
+                                extract_cmd,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                shell=False,
+                                preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                            )
+                            extra_procs_local.append(extract_proc)
+                            extra_procs.append(extract_proc)
+                            out, err = extract_proc.communicate()
+                            if extract_proc.returncode != 0:
+                                msg = err.decode('utf-8', errors='replace') if err else 'Unknown extraction error'
+                                socketio.emit('message', {'message': f'?? Extraction failed: {msg}\n'})
+                                try:
+                                    shutil.rmtree(temp_dir_for_archive)
+                                except Exception:
+                                    pass
+                                temp_dirs.remove(temp_dir_for_archive)
+                                return "Extraction failed"
+                        except FileNotFoundError:
+                            socketio.emit('message', {'message': f'?? Missing extractor on system for archive: {file}\n'})
                             try:
                                 shutil.rmtree(temp_dir_for_archive)
                             except Exception:
                                 pass
                             temp_dirs.remove(temp_dir_for_archive)
-                            return "Extraction failed"
-                    except FileNotFoundError:
-                        socketio.emit('message', {'message': f'?? Missing extractor on system for archive: {file}\n'})
-                        try:
-                            shutil.rmtree(temp_dir_for_archive)
-                        except Exception:
-                            pass
-                        temp_dirs.remove(temp_dir_for_archive)
-                        return "Missing extractor"
+                            return "Missing extractor"
 
-                # count files in extracted temp dir
-                cnt = 0
-                for _, _, fns in os.walk(temp_dir_for_archive):
-                    for _ in fns:
-                        cnt += 1
-                total_files = cnt if cnt > 0 else 1
-                start_rg_for_path(temp_dir_for_archive)
+                    # 解包后按目录启动 rg
+                    cnt = 0
+                    for _, _, fns in os.walk(temp_dir_for_archive):
+                        for _ in fns:
+                            cnt += 1
+                    total_files = cnt if cnt > 0 else 1
+                    start_rg_for_path(temp_dir_for_archive)
 
             else:
                 # single normal file: count as 1
@@ -600,8 +724,148 @@ def search():
                     else:
                         non_excluded_count += 1
             total_files = non_excluded_count + len(compressed_files) + len(excel_files)
-            # For archives, extract and count files inside (add to total). Use py7zr/rarfile if available, else external
+            # For archives, try streaming with python libs first; if streaming succeeds, it will start rg per member.
             for full_archive in archive_files:
+                streamed = False
+                try:
+                    alc = full_archive.lower()
+                    # zip streaming
+                    if alc.endswith(('.zip', '.jar', '.war')):
+                        try:
+                            import zipfile
+                            with zipfile.ZipFile(full_archive, 'r') as zf:
+                                members = [n for n in zf.namelist() if not n.endswith('/')]
+                                if members:
+                                    for name in members:
+                                        label = os.path.relpath(full_archive, data_dir) + '/' + name
+                                        supports_label = check_rg_supports_label()
+                                        if supports_label:
+                                            cmd = rg_base.copy() + ['--label', label, '--', keyword, '-']
+                                        else:
+                                            cmd = rg_base.copy() + ['--', keyword, '-']
+                                        try:
+                                            rg_proc = subprocess.Popen(
+                                                cmd,
+                                                stdin=subprocess.PIPE,
+                                                stdout=subprocess.PIPE,
+                                                stderr=subprocess.STDOUT,
+                                                shell=False,
+                                                preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                                            )
+                                            extra_procs_local.append(rg_proc)
+                                            all_rg_procs.append(rg_proc)
+                                            if not supports_label:
+                                                _proc_label_map[rg_proc.pid] = label
+                                            with zf.open(name, 'r') as member_f:
+                                                try:
+                                                    shutil.copyfileobj(member_f, rg_proc.stdin)
+                                                except Exception:
+                                                    pass
+                                            try:
+                                                rg_proc.stdin.close()
+                                            except Exception:
+                                                pass
+                                            total_files += 1
+                                        except Exception:
+                                            continue
+                                    streamed = True
+                        except Exception:
+                            streamed = False
+                    # rar streaming
+                    elif alc.endswith('.rar'):
+                        try:
+                            import rarfile
+                            rf = rarfile.RarFile(full_archive)
+                            members = rf.infolist()
+                            for mi in members:
+                                if mi.isdir():
+                                    continue
+                                name = mi.filename
+                                label = os.path.relpath(full_archive, data_dir) + '/' + name
+                                supports_label = check_rg_supports_label()
+                                if supports_label:
+                                    cmd = rg_base.copy() + ['--label', label, '--', keyword, '-']
+                                else:
+                                    cmd = rg_base.copy() + ['--', keyword, '-']
+                                try:
+                                    rg_proc = subprocess.Popen(
+                                        cmd,
+                                        stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT,
+                                        shell=False,
+                                        preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                                    )
+                                    extra_procs_local.append(rg_proc)
+                                    all_rg_procs.append(rg_proc)
+                                    if not supports_label:
+                                        _proc_label_map[rg_proc.pid] = label
+                                    with rf.open(mi) as member_f:
+                                        try:
+                                            shutil.copyfileobj(member_f, rg_proc.stdin)
+                                        except Exception:
+                                            pass
+                                    try:
+                                        rg_proc.stdin.close()
+                                    except Exception:
+                                        pass
+                                    total_files += 1
+                                except Exception:
+                                    continue
+                            streamed = True
+                        except Exception:
+                            streamed = False
+                    # 7z streaming via py7zr
+                    elif alc.endswith('.7z'):
+                        try:
+                            import py7zr
+                            with py7zr.SevenZipFile(full_archive, mode='r') as z:
+                                d = z.readall()
+                                for name, b in d.items():
+                                    if not name:
+                                        continue
+                                    label = os.path.relpath(full_archive, data_dir) + '/' + name
+                                    supports_label = check_rg_supports_label()
+                                    if supports_label:
+                                        cmd = rg_base.copy() + ['--label', label, '--', keyword, '-']
+                                    else:
+                                        cmd = rg_base.copy() + ['--', keyword, '-']
+                                    try:
+                                        rg_proc = subprocess.Popen(
+                                            cmd,
+                                            stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT,
+                                            shell=False,
+                                            preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                                        )
+                                        extra_procs_local.append(rg_proc)
+                                        all_rg_procs.append(rg_proc)
+                                        if not supports_label:
+                                            _proc_label_map[rg_proc.pid] = label
+                                        bio = io.BytesIO(b)
+                                        try:
+                                            shutil.copyfileobj(bio, rg_proc.stdin)
+                                        except Exception:
+                                            pass
+                                        try:
+                                            rg_proc.stdin.close()
+                                        except Exception:
+                                            pass
+                                        total_files += 1
+                                    except Exception:
+                                        continue
+                            streamed = True
+                        except Exception:
+                            streamed = False
+                except Exception:
+                    streamed = False
+
+                if streamed:
+                    # 已由流式处理启动 rg，无需再 extract 到临时目录
+                    continue
+
+                # 若流式失败，回退到原有解包到 temp dir 的方式（仍然存在外部 extractor 的依赖）
                 try:
                     temp_dir_for_archive = tempfile.mkdtemp(prefix='rg_archive_')
                     temp_dirs.append(temp_dir_for_archive)
@@ -618,6 +882,7 @@ def search():
                             extracted_ok = True
                     except Exception:
                         extracted_ok = False
+
                     if not extracted_ok:
                         if full_archive.lower().endswith('.7z'):
                             ok, msg = try_py7zr_extract(full_archive, temp_dir_for_archive)
@@ -627,6 +892,7 @@ def search():
                             ok, msg = try_rarfile_extract(full_archive, temp_dir_for_archive)
                             if ok:
                                 extracted_ok = True
+
                     if not extracted_ok:
                         try:
                             if full_archive.lower().endswith(('.zip', '.jar', '.war')):
