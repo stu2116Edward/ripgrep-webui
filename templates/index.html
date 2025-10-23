@@ -135,6 +135,9 @@
 var socket = io({path: '/io'});
 
 let running = false;
+let pendingSubmit = false;
+let lastSubmitAt = 0;
+const DEBOUNCE_MS = 600;
 let receivedChunks = 0;
 let matches = 0;
 let files_total = 0;
@@ -192,6 +195,7 @@ function setProgressState(state, opts = {}) {
         matchEl.textContent = `匹配：${matches} 条`;
         percent.textContent = '已取消';
     } else if (state === 'error') {
+        showProgress();
         bar.style.width = '100%';
         bar.className = 'progress-bar bg-warning';
         badge.className = 'badge badge-warning progress-status-badge';
@@ -230,23 +234,25 @@ window.addEventListener('DOMContentLoaded', function(){
 
 socket.on('message', data => {
     const text = data.message.replace(/\r?\n/g, '\n');
-    /* 静默：不把“??? Cancelled ???”显示到页面 */
+
+    // 取消：恢复所有控件与状态
     if (text.includes('??? Cancelled ???')) {
-        // reflect cancelled UI
         running = false;
+        pendingSubmit = false;
         setProgressState('cancelled');
         disableControls(false);
-        // hide after a short delay (但不重置 matchDisplay)
+        document.getElementById('submitBtn').disabled = false;
         clearTimeout(progressHideTimeout);
         progressHideTimeout = setTimeout(() => hideProgress(), 1200);
         return;
     }
 
+    // 服务端已开始检索：进入运行态
     if (text.includes('Started')) {
-        // server started search
         running = true;
+        pendingSubmit = false;
         receivedChunks = 0;
-        matches = 0; // reset visible matches at the start of a new run
+        matches = 0; // 每次新启动重置匹配显示
         files_total = 0;
         files_done = 0;
         document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
@@ -255,12 +261,25 @@ socket.on('message', data => {
         document.getElementById('cancelBtn').disabled = false;
         return;
     }
+
+    // 服务端忙：提示并恢复按钮（防止长时间不可点击）
+    if (text.includes('Busy')) {
+        pendingSubmit = false;
+        setProgressState('error', {msg: '服务器忙，请稍后再试'});
+        disableControls(false);
+        document.getElementById('submitBtn').disabled = false;
+        clearTimeout(progressHideTimeout);
+        progressHideTimeout = setTimeout(() => hideProgress(), 1200);
+        return;
+    }
+
+    // 完成：退出运行态并恢复控件
     if (text.includes('Done')) {
-        // server finished
         running = false;
+        pendingSubmit = false;
         setProgressState('done');
         disableControls(false);
-        // hide progress after a short animation but keep matchDisplay unchanged (persist)
+        document.getElementById('submitBtn').disabled = false;
         clearTimeout(progressHideTimeout);
         progressHideTimeout = setTimeout(() => {
             hideProgress();
@@ -268,17 +287,22 @@ socket.on('message', data => {
         return;
     }
 
-    // 非控制消息：显示到结果区并计为一个“块”
-    document.getElementById('result').textContent = text + document.getElementById('result').textContent;
-    receivedChunks++;
-    if (!running) {
-        running = true;
-        disableControls(true);
-        document.getElementById('cancelBtn').disabled = false;
+    // 静默：屏蔽非文件内容（服务端提示/错误以 "??" 开头）
+    if (/^\s*\?\?/.test(text)) {
+        return;
     }
-    // update pct heuristic, but it'll be overridden by progress events when available
-    let pct = files_total ? Math.min(95, Math.round((files_done / files_total) * 100)) : Math.min(95, 5 + Math.floor(receivedChunks * 2));
-    setProgressState('running', {pct: pct, text: `检索中 • ${receivedChunks} 块`});
+
+    // 普通输出：仅在有内容时写入结果并计数（避免空行增加块数）
+    if (text.trim().length > 0) {
+        document.getElementById('result').textContent = text + document.getElementById('result').textContent;
+        receivedChunks++;
+        // 仅更新明细，不在此处重绘进度百分比，避免与 progress 事件打架
+        const detailEl = document.getElementById('progressDetail');
+        detailEl.textContent = `已接收：${receivedChunks} 块 / ${files_done} 文件`;
+    } else {
+        // 保留分隔空行但不计块数
+        document.getElementById('result').textContent = text + document.getElementById('result').textContent;
+    }
 });
 
 // 监听后端 progress 事件（包含 matches, files_total, files_done）
@@ -296,9 +320,9 @@ socket.on('progress', data => {
     // compute percentage if files_total available
     let pct = 0;
     if (files_total && files_total > 0) {
-        pct = Math.round((files_done / files_total) * 100);
-        if (pct > 99 && !running) pct = 100;
-        pct = Math.min(100, pct);
+        pct = Math.floor((files_done / files_total) * 100);
+        // 运行中封顶 99%，避免未完成时显示 100%
+        pct = running ? Math.min(99, pct) : Math.min(100, pct);
     } else {
         // fallback gentle growth
         pct = Math.min(95, 5 + Math.floor(receivedChunks * 2));
@@ -313,20 +337,28 @@ function sendKeyword() {
         alert('请输入关键词后再提交！');
         return;
     }
+
+    // 防抖 + 运行中防重复
+    const now = Date.now();
+    if (running || pendingSubmit || (now - lastSubmitAt < DEBOUNCE_MS)) {
+        return;
+    }
+    lastSubmitAt = now;
+    pendingSubmit = true;
+
     const before = parseInt(document.getElementById('context_before').value || '0', 10);
     const after  = parseInt(document.getElementById('context_after').value || '0', 10);
     const file   = document.getElementById('file').value || '';
 
-    // immediately show progress so user gets instant feedback
-    running = true;
+    // 立即显示进度，但仅暂时禁用提交按钮（其余控件待服务端确认后再禁用）
     receivedChunks = 0;
-    matches = 0; // 重置匹配计数：只有新的提交会重置显示
+    matches = 0; // 新提交重置显示计数
     files_total = 0;
     files_done = 0;
     document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
+    showProgress();
     setProgressState('running', {pct:5, text: '已提交，等待结果...'});
-    disableControls(true);
-    document.getElementById('cancelBtn').disabled = false;
+    document.getElementById('submitBtn').disabled = true;
 
     fetch('/search', {
         method: 'POST',
@@ -334,9 +366,11 @@ function sendKeyword() {
         body: JSON.stringify({keyword: kw, context_before: before, context_after: after, file})
     }).catch(err => {
         // request failed
+        pendingSubmit = false;
         running = false;
         setProgressState('error', {msg: '提交失败'});
         disableControls(false);
+        document.getElementById('submitBtn').disabled = false;
         clearTimeout(progressHideTimeout);
         progressHideTimeout = setTimeout(() => { hideProgress(); }, 1200);
     });
@@ -346,8 +380,10 @@ function cancelSearch() {
     fetch('/cancel', {method: 'POST'}).catch(()=>{});
     // immediate local feedback; actual cancelled signal may also come from server
     running = false;
+    pendingSubmit = false;
     setProgressState('cancelled');
     disableControls(false);
+    document.getElementById('submitBtn').disabled = false;
     clearTimeout(progressHideTimeout);
     progressHideTimeout = setTimeout(() => { hideProgress(); }, 1200);
 }
@@ -359,9 +395,6 @@ function clearResult() {
     matches = 0;
     document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
 
-    // If there is no active search, also reset/hide progress UI to a clean idle state.
-    // If a search is running, keep the progress bar visible (so user still sees live progress),
-    // but reset the 'receivedChunks' counter so progress detail becomes meaningful again.
     if (!running) {
         files_total = 0;
         files_done = 0;
