@@ -30,8 +30,9 @@ ARCHIVE_EXTS = (
     '.7z', '.rar'   # 支持 .7z / .rar
 )
 
-# 支持的电子表格后缀
+# 支持的电子表格/文本后缀
 EXCEL_EXTS = ('.xls', '.xlsx')
+CSV_EXTS = ('.csv',)
 
 # 缓存 ripgrep 是否支持 --label 参数（None 表示尚未检测）
 _RG_SUPPORTS_LABEL = None
@@ -40,6 +41,8 @@ _proc_label_map = {}
 
 
 def is_single_file_compressed(filename_lower):
+    if filename_lower.endswith(('.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz')):
+        return False
     return filename_lower.endswith(SINGLE_COMPRESSED_EXTS)
 
 
@@ -49,6 +52,20 @@ def is_archive_multi_file(filename_lower):
 
 def is_excel_file(filename_lower):
     return filename_lower.endswith(EXCEL_EXTS)
+
+
+def is_csv_file(filename_lower):
+    return filename_lower.endswith(CSV_EXTS)
+
+
+def strip_single_compress_ext(filename_lower):
+    """去掉单一压缩扩展，返回内部真实扩展（小写，如 .xlsx/.csv），不匹配则返回空串"""
+    for ce in SINGLE_COMPRESSED_EXTS:
+        if filename_lower.endswith(ce):
+            base = filename_lower[:-len(ce)]
+            inner_ext = os.path.splitext(base)[1].lower()
+            return inner_ext
+    return ''
 
 
 def has_cmd(name):
@@ -196,6 +213,34 @@ def build_decompress_command(path_lower, real_path):
     return None
 
 
+def list_7z_members(archive_path):
+    names = []
+    if not has_cmd('7z'):
+        return names
+    try:
+        p = subprocess.run(['7z', 'l', '-slt', archive_path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+        out_lines = p.stdout.decode('utf-8', errors='replace').splitlines()
+        current_path = None
+        current_type = None
+        for line in out_lines:
+            s = line.strip()
+            if not s:
+                if current_path and (not current_type or current_type.lower() == 'file'):
+                    names.append(current_path)
+                current_path = None
+                current_type = None
+                continue
+            if s.startswith('Path = '):
+                current_path = s[7:]
+            elif s.startswith('Type = '):
+                current_type = s[7:]
+        if current_path and (not current_type or current_type.lower() == 'file'):
+            names.append(current_path)
+    except Exception:
+        pass
+    return names
+
+
 def safe_extract_tar(tar, path):
     import tarfile
     for member in tar.getmembers():
@@ -301,6 +346,147 @@ def stream_excel_to_writer(path, out_stream):
     except Exception as e:
         socketio.emit('message', {'message': f'?? Excel parse failed for {os.path.basename(path)}: {e}\n'})
         return
+
+# 允许传入内存字节的 Excel 转换（供归档成员或解压输出使用）
+def stream_excel_bytes_to_writer(name_lower, data_bytes, out_stream):
+    try:
+        if name_lower.endswith('.xlsx'):
+            import openpyxl, io
+            wb = openpyxl.load_workbook(io.BytesIO(data_bytes), read_only=True, data_only=True)
+            for sheet in wb:
+                try:
+                    out_stream.write((f"# sheet: {sheet.title}\n").encode('utf-8'))
+                except Exception:
+                    pass
+                for row in sheet.iter_rows(values_only=True):
+                    try:
+                        vals = [(str(c) if c is not None else '') for c in row]
+                        out_stream.write(('\t'.join(vals) + '\n').encode('utf-8'))
+                    except Exception:
+                        try:
+                            safe_vals = [str(v) if v is not None else '' for v in row]
+                            out_stream.write(('\t'.join(safe_vals) + '\n').encode('utf-8', errors='replace'))
+                        except Exception:
+                            continue
+            try:
+                wb.close()
+            except Exception:
+                pass
+        elif name_lower.endswith('.xls'):
+            import xlrd
+            wb = xlrd.open_workbook(file_contents=data_bytes, on_demand=True)
+            for si in range(wb.nsheets):
+                sheet = wb.sheet_by_index(si)
+                try:
+                    out_stream.write((f"# sheet: {sheet.name}\n").encode('utf-8'))
+                except Exception:
+                    pass
+                for r in range(sheet.nrows):
+                    try:
+                        row = sheet.row_values(r)
+                        vals = [(str(c) if c is not None else '') for c in row]
+                        out_stream.write(('\t'.join(vals) + '\n').encode('utf-8'))
+                    except Exception:
+                        try:
+                            out_stream.write(('\t'.join([str(c) for c in sheet.row_values(r)]) + '\n').encode('utf-8', errors='replace'))
+                        except Exception:
+                            continue
+            try:
+                wb.release_resources()
+            except Exception:
+                pass
+    except Exception as e:
+        socketio.emit('message', {'message': f'?? Excel parse failed (bytes) for {name_lower}: {e}\n'})
+        return
+
+# CSV 文件对象直接复制到输出（提供统一接口）
+def stream_csv_fileobj_to_writer(fileobj, out_stream):
+    try:
+        last_byte = None
+        while True:
+            chunk = fileobj.read(64 * 1024)
+            if not chunk:
+                break
+            out_stream.write(chunk)
+            try:
+                if chunk:
+                    last_byte = chunk[-1]
+            except Exception:
+                pass
+        if last_byte is not None and last_byte != 0x0A:
+            try:
+                out_stream.write(b'\n')
+            except Exception:
+                pass
+    except Exception:
+        # 退回一次性读写，并保证行尾换行
+        try:
+            data = fileobj.read()
+            if data:
+                out_stream.write(data)
+                try:
+                    if data[-1] != 0x0A:
+                        out_stream.write(b'\n')
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+# 统一的分块拷贝（避免一次性读入内存）
+STREAM_CHUNK_SIZE = 256 * 1024  # 256KB
+
+def copy_fileobj_chunked(src, dst, chunk_size: int = STREAM_CHUNK_SIZE):
+    try:
+        while True:
+            chunk = src.read(chunk_size)
+            if not chunk:
+                break
+            try:
+                dst.write(chunk)
+            except BrokenPipeError:
+                break
+    except Exception:
+        # 尝试最后一次性拷贝，尽量保证输出完整
+        try:
+            data = src.read()
+            if data:
+                try:
+                    dst.write(data)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    try:
+        if hasattr(dst, 'flush'):
+            dst.flush()
+    except Exception:
+        pass
+
+# 将输入流落盘为临时Excel文件后再流式转换（避免内存峰值）
+import tempfile as _tempfile_mod
+
+def spool_stream_to_temp_then_stream_excel(name_lower: str, in_stream, out_stream):
+    ext = '.xlsx' if name_lower.endswith('.xlsx') else ('.xls' if name_lower.endswith('.xls') else '.xlsx')
+    tmp = _tempfile_mod.NamedTemporaryFile(prefix='rg_excel_', suffix=ext, delete=False)
+    tmp_path = tmp.name
+    try:
+        copy_fileobj_chunked(in_stream, tmp)
+        try:
+            tmp.flush()
+        except Exception:
+            pass
+        try:
+            tmp.close()
+        except Exception:
+            pass
+        # 直接复用现有的按路径Excel流式转换
+        stream_excel_to_writer(tmp_path, out_stream)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
 # ===== 结束 Excel 转换函数 =====
 
 
@@ -327,6 +513,11 @@ def search():
     # 基本 rg 参数
     rg_base = ['rg', '-uuu', '--smart-case', '--json']
 
+    # 确认 rg 可用，避免运行时报错
+    if not has_cmd('rg'):
+        socketio.emit('message', {'message': 'ripgrep 未安装或不可用，请在系统 PATH 中提供 rg。'})
+        return "rg not found"
+
     # 上下文参数
     if context_before and context_before > 0:
         rg_base += ['-B', str(context_before)]
@@ -339,14 +530,33 @@ def search():
         data_dir = os.path.dirname(__file__)
 
     # 根据是否指定文件构建最终检索路径
+    include_glob_for_basename = None
+    data_dir_abs = os.path.abspath(data_dir)
     if file:
-        base = os.path.basename(file)
-        if base:
-            search_path = os.path.join(data_dir, base)
+        candidate_norm = os.path.normpath(os.path.join(data_dir_abs, file))
+        candidate_abs = os.path.abspath(candidate_norm)
+        # 仅允许在 data_dir 内部
+        if candidate_abs.startswith(data_dir_abs + os.sep) or candidate_abs == data_dir_abs:
+            # 若解析后的路径存在（文件或目录），直接使用
+            if os.path.exists(candidate_abs):
+                search_path = candidate_abs
+            else:
+                # 如果仅是文件名（没有路径分隔），在整个 data_dir 下匹配该文件名
+                base_only = (os.path.basename(file) == file) and ('/' not in file) and ('\\' not in file)
+                if base_only:
+                    include_glob_for_basename = os.path.basename(file)
+                    search_path = data_dir_abs
+                else:
+                    # 回退：限制在 data_dir 内并使用 basename
+                    search_path = os.path.join(data_dir_abs, os.path.basename(file))
         else:
-            search_path = data_dir
+            search_path = os.path.join(data_dir_abs, os.path.basename(file))
     else:
-        search_path = data_dir
+        search_path = data_dir_abs
+
+    # 若设置了仅文件名过滤，使用 rg 的 glob 进行包含匹配
+    if include_glob_for_basename:
+        rg_base += ['--glob', f'**/{include_glob_for_basename}']
 
     # 将要运行并监听输出的 rg 进程列表（主 rg + 为每个压缩/归档额外启动的 rg）
     all_rg_procs = []
@@ -367,6 +577,9 @@ def search():
                 for pat in exclude_patterns:
                     cmd += ['--glob', f'!{pat}']
             supports_label = check_rg_supports_label()
+            # 当通过 stdin 流式喂入时，确保将二进制当作文本处理（避免被跳过）
+            if path == '-':
+                cmd += ['-a']
             if label and supports_label:
                 # rg 支持 --label：把 label 传给 rg（此时 rg 会在 JSON 的 begin/path 中显示 label）
                 cmd += ['--label', label, '--', keyword, '-'] if path == '-' else ['--label', label, '--', keyword, path]
@@ -420,13 +633,61 @@ def search():
                     socketio.emit('message', {'message': f'?? Failed to start rg for excel: {e}\n'})
                     return "Excel stream failed"
 
-            # === 直接流式处理 tar.gz/tgz ===
-            elif file_lower.endswith('.tar.gz') or file_lower.endswith('.tgz'):
-                # 直接流式处理 tar.gz 归档内容，无需落盘；为每个归档内文件启动一个 rg（stdin）
+            # === 处理单文件压缩：解压并按内部类型转换后流式喂入 rg ===
+            elif is_single_file_compressed(file_lower):
+                try:
+                    rel_label = os.path.basename(file)
+                    dec_cmd = build_decompress_command(file_lower, search_path)
+                    inner_lower = strip_single_compress_ext(file_lower)
+                    if dec_cmd:
+                        decompressor_proc = subprocess.Popen(
+                            dec_cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            shell=False,
+                            preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                        )
+                        extra_procs_local.append(decompressor_proc)
+                        extra_procs.append(decompressor_proc)
+                        if is_excel_file(inner_lower):
+                            def feed_fn(w, proc=decompressor_proc, name=inner_lower):
+                                data = proc.stdout.read() if proc.stdout else b''
+                                stream_excel_bytes_to_writer(name, data, w)
+                            start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                        else:
+                            start_rg_for_path('-', stdin_pipe=decompressor_proc.stdout, label=rel_label)
+                    else:
+                        # 使用 python 解压
+                        if is_excel_file(inner_lower):
+                            def feed_fn(w, p=search_path, e=file_lower, inner=inner_lower):
+                                bio = io.BytesIO()
+                                python_decompress_feed(p, e, bio)
+                                data = bio.getvalue()
+                                stream_excel_bytes_to_writer(inner, data, w)
+                            start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                        else:
+                            def feed_fn(w, p=search_path, e=file_lower):
+                                python_decompress_feed(p, e, w)
+                            start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                except Exception as e:
+                    socketio.emit('message', {'message': f'?? Single-compressed stream failed: {e}\n'})
+                    return "Single-compressed stream failed"
+
+            # === 直接流式处理 tar 系列归档（gz/bz2/xz/无压缩） ===
+            elif file_lower.endswith(('.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz', '.tar')):
+                # 直接流式处理 tar 归档内容，无需落盘；为每个归档内文件启动一个 rg（stdin）
                 try:
                     import tarfile
+                    if file_lower.endswith(('.tar.gz', '.tgz')):
+                        tar_mode = 'r:gz'
+                    elif file_lower.endswith(('.tar.bz2', '.tbz2')):
+                        tar_mode = 'r:bz2'
+                    elif file_lower.endswith(('.tar.xz', '.txz')):
+                        tar_mode = 'r:xz'
+                    else:
+                        tar_mode = 'r'
                     total_files = 0
-                    with tarfile.open(search_path, mode='r:gz') as tar:
+                    with tarfile.open(search_path, mode=tar_mode) as tar:
                         for member in tar.getmembers():
                             if member.isfile():
                                 total_files += 1
@@ -458,7 +719,14 @@ def search():
                                                 pass
                                         # 将文件流写入 rg stdin（阻塞写入是可以的，因为这是独立进程）
                                         try:
-                                            shutil.copyfileobj(f, rg_proc.stdin)
+                                            lower = member.name.lower()
+                                            if is_excel_file(lower):
+                                                data = f.read()
+                                                stream_excel_bytes_to_writer(lower, data, rg_proc.stdin)
+                                            elif is_csv_file(lower):
+                                                stream_csv_fileobj_to_writer(f, rg_proc.stdin)
+                                            else:
+                                                shutil.copyfileobj(f, rg_proc.stdin)
                                         except Exception:
                                             pass
                                         try:
@@ -473,8 +741,8 @@ def search():
                         total_files = 1
                         start_rg_for_path(search_path)
                 except Exception as e:
-                    socketio.emit('message', {'message': f'?? Tar.gz stream failed: {e}\n'})
-                    return "Tar.gz stream failed"
+                    socketio.emit('message', {'message': f'?? Tar stream failed: {e}\n'})
+                    return "Tar stream failed"
 
             # 直接流式处理 zip/rar/7z 等归档（无外部 extractor 情况下的回退） ===
             elif is_archive_multi_file(file_lower):
@@ -495,9 +763,9 @@ def search():
                                 label = f"{os.path.basename(file)}/{name}"
                                 supports_label = check_rg_supports_label()
                                 if supports_label:
-                                    cmd = rg_base.copy() + ['--label', label, '--', keyword, '-']
+                                    cmd = rg_base.copy() + ['-a', '--label', label, '--', keyword, '-']
                                 else:
-                                    cmd = rg_base.copy() + ['--', keyword, '-']
+                                    cmd = rg_base.copy() + ['-a', '--', keyword, '-']
                                 try:
                                     rg_proc = subprocess.Popen(
                                         cmd,
@@ -516,7 +784,13 @@ def search():
                                             pass
                                     with zf.open(name, 'r') as member_f:
                                         try:
-                                            shutil.copyfileobj(member_f, rg_proc.stdin)
+                                            lower = name.lower()
+                                            if is_excel_file(lower):
+                                                spool_stream_to_temp_then_stream_excel(lower, member_f, rg_proc.stdin)
+                                            elif is_csv_file(lower):
+                                                stream_csv_fileobj_to_writer(member_f, rg_proc.stdin)
+                                            else:
+                                                copy_fileobj_chunked(member_f, rg_proc.stdin)
                                         except Exception:
                                             pass
                                     try:
@@ -528,6 +802,8 @@ def search():
                             streamed = True
                     # rar
                     elif file_lower.endswith('.rar'):
+                        streamed_local = False
+                        # 首先尝试使用 rarfile 库进行逐成员流式处理
                         try:
                             import rarfile
                             rf = rarfile.RarFile(search_path)
@@ -541,9 +817,9 @@ def search():
                                 label = f"{os.path.basename(file)}/{name}"
                                 supports_label = check_rg_supports_label()
                                 if supports_label:
-                                    cmd = rg_base.copy() + ['--label', label, '--', keyword, '-']
+                                    cmd = rg_base.copy() + ['-a', '--label', label, '--', keyword, '-']
                                 else:
-                                    cmd = rg_base.copy() + ['--', keyword, '-']
+                                    cmd = rg_base.copy() + ['-a', '--', keyword, '-']
                                 try:
                                     rg_proc = subprocess.Popen(
                                         cmd,
@@ -562,7 +838,13 @@ def search():
                                             pass
                                     with rf.open(mi) as member_f:
                                         try:
-                                            shutil.copyfileobj(member_f, rg_proc.stdin)
+                                            lower = name.lower()
+                                            if is_excel_file(lower):
+                                                spool_stream_to_temp_then_stream_excel(lower, member_f, rg_proc.stdin)
+                                            elif is_csv_file(lower):
+                                                stream_csv_fileobj_to_writer(member_f, rg_proc.stdin)
+                                            else:
+                                                copy_fileobj_chunked(member_f, rg_proc.stdin)
                                         except Exception:
                                             pass
                                     try:
@@ -571,26 +853,22 @@ def search():
                                         pass
                                 except Exception:
                                     continue
-                            streamed = True
+                            streamed_local = True
                         except Exception:
-                            streamed = False
-                    # 7z via py7zr (py7zr.readall 或 .read 遍历)
-                    elif file_lower.endswith('.7z'):
-                        try:
-                            import py7zr
-                            with py7zr.SevenZipFile(search_path, mode='r') as z:
-                                d = z.readall()  # dict: name -> bytes
+                            streamed_local = False
+                        # 回退：使用 7z 对 .rar 进行无落盘逐成员流式处理
+                        if not streamed_local and has_cmd('7z'):
+                            try:
+                                names = list_7z_members(search_path)
                                 total_files = 0
-                                for name, b in d.items():
-                                    if not name:
-                                        continue
+                                for name in names:
                                     total_files += 1
                                     label = f"{os.path.basename(file)}/{name}"
                                     supports_label = check_rg_supports_label()
                                     if supports_label:
-                                        cmd = rg_base.copy() + ['--label', label, '--', keyword, '-']
+                                        cmd = rg_base.copy() + ['-a', '--label', label, '--', keyword, '-']
                                     else:
-                                        cmd = rg_base.copy() + ['--', keyword, '-']
+                                        cmd = rg_base.copy() + ['-a', '--', keyword, '-']
                                     try:
                                         rg_proc = subprocess.Popen(
                                             cmd,
@@ -607,20 +885,174 @@ def search():
                                                 _proc_label_map[rg_proc.pid] = label
                                             except Exception:
                                                 pass
-                                        bio = io.BytesIO(b)
+                                        dec_proc = subprocess.Popen(
+                                            ['7z', 'x', '-so', search_path, name],
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE,
+                                            shell=False,
+                                            preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                                        )
+                                        extra_procs_local.append(dec_proc)
                                         try:
-                                            shutil.copyfileobj(bio, rg_proc.stdin)
+                                            lower = name.lower()
+                                            if is_excel_file(lower):
+                                                spool_stream_to_temp_then_stream_excel(lower, dec_proc.stdout, rg_proc.stdin)
+                                            elif is_csv_file(lower):
+                                                stream_csv_fileobj_to_writer(dec_proc.stdout, rg_proc.stdin)
+                                            else:
+                                                copy_fileobj_chunked(dec_proc.stdout, rg_proc.stdin)
                                         except Exception:
                                             pass
                                         try:
                                             rg_proc.stdin.close()
                                         except Exception:
                                             pass
+                                        try:
+                                            dec_proc.stdout.close()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            dec_proc.wait()
+                                        except Exception:
+                                            pass
                                     except Exception:
                                         continue
-                            streamed = True
-                        except Exception:
-                            streamed = False
+                                streamed_local = True
+                            except Exception:
+                                streamed_local = False
+                        streamed = streamed_local
+                    # 7z 优先使用 7z CLI 逐成员流式；若不可用则回退 py7zr
+                    elif file_lower.endswith('.7z'):
+                        streamed_local = False
+                        if has_cmd('7z'):
+                            try:
+                                names = list_7z_members(search_path)
+                                total_files = 0
+                                for name in names:
+                                    total_files += 1
+                                    label = f"{os.path.basename(file)}/{name}"
+                                    supports_label = check_rg_supports_label()
+                                    cmd = rg_base.copy() + (['-a', '--label', label, '--', keyword, '-'] if supports_label else ['-a', '--', keyword, '-'])
+                                    try:
+                                        rg_proc = subprocess.Popen(
+                                            cmd,
+                                            stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT,
+                                            shell=False,
+                                            preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                                        )
+                                        extra_procs_local.append(rg_proc)
+                                        all_rg_procs.append(rg_proc)
+                                        if not supports_label:
+                                            try:
+                                                _proc_label_map[rg_proc.pid] = label
+                                            except Exception:
+                                                pass
+                                        dec_proc = subprocess.Popen(
+                                            ['7z', 'x', '-so', search_path, name],
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE,
+                                            shell=False,
+                                            preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                                        )
+                                        extra_procs_local.append(dec_proc)
+                                        try:
+                                            lower = name.lower()
+                                            if is_excel_file(lower):
+                                                spool_stream_to_temp_then_stream_excel(lower, dec_proc.stdout, rg_proc.stdin)
+                                            elif is_csv_file(lower):
+                                                stream_csv_fileobj_to_writer(dec_proc.stdout, rg_proc.stdin)
+                                            else:
+                                                copy_fileobj_chunked(dec_proc.stdout, rg_proc.stdin)
+                                        except Exception:
+                                            pass
+                                        try:
+                                            rg_proc.stdin.close()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            dec_proc.stdout.close()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            dec_proc.wait()
+                                        except Exception:
+                                            pass
+                                    except Exception:
+                                        continue
+                                streamed_local = True
+                            except Exception:
+                                streamed_local = False
+                        if not streamed_local:
+                            try:
+                                import py7zr
+                                with py7zr.SevenZipFile(search_path, mode='r') as z:
+                                    try:
+                                        names = [n for n in z.getnames() if n]
+                                    except Exception:
+                                        try:
+                                            names = list((z.readall() or {}).keys())
+                                        except Exception:
+                                            names = []
+                                    total_files = 0
+                                    for name in names:
+                                        total_files += 1
+                                        label = f"{os.path.basename(file)}/{name}"
+                                        supports_label = check_rg_supports_label()
+                                        cmd = rg_base.copy() + (['-a', '--label', label, '--', keyword, '-'] if supports_label else ['-a', '--', keyword, '-'])
+                                        try:
+                                            rg_proc = subprocess.Popen(
+                                                cmd,
+                                                stdin=subprocess.PIPE,
+                                                stdout=subprocess.PIPE,
+                                                stderr=subprocess.STDOUT,
+                                                shell=False,
+                                                preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                                            )
+                                            extra_procs_local.append(rg_proc)
+                                            all_rg_procs.append(rg_proc)
+                                            if not supports_label:
+                                                try:
+                                                    _proc_label_map[rg_proc.pid] = label
+                                                except Exception:
+                                                    pass
+                                            try:
+                                                dm = z.read([name])
+                                                obj = dm.get(name)
+                                                if obj is None:
+                                                    raise Exception('py7zr read returned None')
+                                                lower = name.lower()
+                                                if is_excel_file(lower):
+                                                    # 先落盘再流式
+                                                    bio = io.BytesIO(obj if isinstance(obj, (bytes, bytearray)) else (obj.getvalue() if hasattr(obj, 'getvalue') else obj.read()))
+                                                    spool_stream_to_temp_then_stream_excel(lower, bio, rg_proc.stdin)
+                                                elif is_csv_file(lower):
+                                                    if isinstance(obj, (bytes, bytearray)):
+                                                        data_bytes = bytes(obj)
+                                                        rg_proc.stdin.write(data_bytes)
+                                                        if len(data_bytes) == 0 or data_bytes[-1] != 0x0A:
+                                                            rg_proc.stdin.write(b'\n')
+                                                    else:
+                                                        stream_csv_fileobj_to_writer(obj, rg_proc.stdin)
+                                                else:
+                                                    if isinstance(obj, (bytes, bytearray)):
+                                                        bio = io.BytesIO(bytes(obj))
+                                                        copy_fileobj_chunked(bio, rg_proc.stdin)
+                                                    else:
+                                                        copy_fileobj_chunked(obj, rg_proc.stdin)
+                                            except Exception:
+                                                pass
+                                            try:
+                                                rg_proc.stdin.close()
+                                            except Exception:
+                                                pass
+                                        except Exception:
+                                            continue
+                                streamed_local = True
+                            except Exception:
+                                streamed_local = False
+                        streamed = streamed_local
                 except Exception:
                     streamed = False
 
@@ -692,13 +1124,32 @@ def search():
                             temp_dirs.remove(temp_dir_for_archive)
                             return "Missing extractor"
 
-                    # 解包后按目录启动 rg
-                    cnt = 0
-                    for _, _, fns in os.walk(temp_dir_for_archive):
-                        for _ in fns:
-                            cnt += 1
-                    total_files = cnt if cnt > 0 else 1
-                    start_rg_for_path(temp_dir_for_archive)
+                    # 解包后按目录启动 rg（同时为 Excel 文件单独流式转换）
+                    excel_files_list = []
+                    non_excel_count = 0
+                    for root, _, fns in os.walk(temp_dir_for_archive):
+                        for fn in fns:
+                            lower = fn.lower()
+                            full = os.path.join(root, fn)
+                            if is_excel_file(lower):
+                                excel_files_list.append(full)
+                            else:
+                                non_excel_count += 1
+                    total_files = (non_excel_count + len(excel_files_list)) if (non_excel_count + len(excel_files_list)) > 0 else 1
+                    # 目录扫描时排除 Excel，避免重复
+                    exclude_patterns = [f'**/*{ext}' for ext in EXCEL_EXTS]
+                    start_rg_for_path(temp_dir_for_archive, exclude_patterns=exclude_patterns)
+                    # 对每个 Excel 文件做流式转换并交给 rg
+                    for full in excel_files_list:
+                        # label 使用 归档名/归档内相对路径
+                        rel_inside = os.path.relpath(full, temp_dir_for_archive)
+                        label = f"{os.path.basename(file)}/{rel_inside}"
+                        def feed_fn(w, p=full):
+                            stream_excel_to_writer(p, w)
+                        try:
+                            start_rg_for_path('-', label=label, python_stream_feed=feed_fn)
+                        except Exception:
+                            continue
 
             else:
                 # single normal file: count as 1
@@ -713,12 +1164,15 @@ def search():
             # gather files first so we can count precisely
             for root, _, fns in os.walk(search_path):
                 for fn in fns:
+                    # 若启用了仅文件名过滤，则只统计匹配的文件
+                    if include_glob_for_basename and os.path.basename(fn) != include_glob_for_basename:
+                        continue
                     full = os.path.join(root, fn)
                     fn_lower = fn.lower()
-                    if is_single_file_compressed(fn_lower):
-                        compressed_files.append(full)
-                    elif is_archive_multi_file(fn_lower):
+                    if is_archive_multi_file(fn_lower):
                         archive_files.append(full)
+                    elif is_single_file_compressed(fn_lower):
+                        compressed_files.append(full)
                     elif is_excel_file(fn_lower):
                         excel_files.append(full)
                     else:
@@ -740,9 +1194,9 @@ def search():
                                         label = os.path.relpath(full_archive, data_dir) + '/' + name
                                         supports_label = check_rg_supports_label()
                                         if supports_label:
-                                            cmd = rg_base.copy() + ['--label', label, '--', keyword, '-']
+                                            cmd = rg_base.copy() + ['-a', '--label', label, '--', keyword, '-']
                                         else:
-                                            cmd = rg_base.copy() + ['--', keyword, '-']
+                                            cmd = rg_base.copy() + ['-a', '--', keyword, '-']
                                         try:
                                             rg_proc = subprocess.Popen(
                                                 cmd,
@@ -758,7 +1212,13 @@ def search():
                                                 _proc_label_map[rg_proc.pid] = label
                                             with zf.open(name, 'r') as member_f:
                                                 try:
-                                                    shutil.copyfileobj(member_f, rg_proc.stdin)
+                                                    lower = name.lower()
+                                                    if is_excel_file(lower):
+                                                        spool_stream_to_temp_then_stream_excel(lower, member_f, rg_proc.stdin)
+                                                    elif is_csv_file(lower):
+                                                        stream_csv_fileobj_to_writer(member_f, rg_proc.stdin)
+                                                    else:
+                                                        copy_fileobj_chunked(member_f, rg_proc.stdin)
                                                 except Exception:
                                                     pass
                                             try:
@@ -773,6 +1233,8 @@ def search():
                             streamed = False
                     # rar streaming
                     elif alc.endswith('.rar'):
+                        streamed_local = False
+                        # 优先尝试 rarfile 库进行逐成员流式处理
                         try:
                             import rarfile
                             rf = rarfile.RarFile(full_archive)
@@ -784,9 +1246,9 @@ def search():
                                 label = os.path.relpath(full_archive, data_dir) + '/' + name
                                 supports_label = check_rg_supports_label()
                                 if supports_label:
-                                    cmd = rg_base.copy() + ['--label', label, '--', keyword, '-']
+                                    cmd = rg_base.copy() + ['-a', '--label', label, '--', keyword, '-']
                                 else:
-                                    cmd = rg_base.copy() + ['--', keyword, '-']
+                                    cmd = rg_base.copy() + ['-a', '--', keyword, '-']
                                 try:
                                     rg_proc = subprocess.Popen(
                                         cmd,
@@ -802,7 +1264,13 @@ def search():
                                         _proc_label_map[rg_proc.pid] = label
                                     with rf.open(mi) as member_f:
                                         try:
-                                            shutil.copyfileobj(member_f, rg_proc.stdin)
+                                            lower = name.lower()
+                                            if is_excel_file(lower):
+                                                spool_stream_to_temp_then_stream_excel(lower, member_f, rg_proc.stdin)
+                                            elif is_csv_file(lower):
+                                                stream_csv_fileobj_to_writer(member_f, rg_proc.stdin)
+                                            else:
+                                                copy_fileobj_chunked(member_f, rg_proc.stdin)
                                         except Exception:
                                             pass
                                     try:
@@ -812,24 +1280,20 @@ def search():
                                     total_files += 1
                                 except Exception:
                                     continue
-                            streamed = True
+                            streamed_local = True
                         except Exception:
-                            streamed = False
-                    # 7z streaming via py7zr
-                    elif alc.endswith('.7z'):
-                        try:
-                            import py7zr
-                            with py7zr.SevenZipFile(full_archive, mode='r') as z:
-                                d = z.readall()
-                                for name, b in d.items():
-                                    if not name:
-                                        continue
+                            streamed_local = False
+                        # 回退：使用 7z 对 .rar 进行无落盘逐成员流式处理
+                        if not streamed_local and has_cmd('7z'):
+                            try:
+                                names = list_7z_members(full_archive)
+                                for name in names:
                                     label = os.path.relpath(full_archive, data_dir) + '/' + name
                                     supports_label = check_rg_supports_label()
                                     if supports_label:
-                                        cmd = rg_base.copy() + ['--label', label, '--', keyword, '-']
+                                        cmd = rg_base.copy() + ['-a', '--label', label, '--', keyword, '-']
                                     else:
-                                        cmd = rg_base.copy() + ['--', keyword, '-']
+                                        cmd = rg_base.copy() + ['-a', '--', keyword, '-']
                                     try:
                                         rg_proc = subprocess.Popen(
                                             cmd,
@@ -843,21 +1307,174 @@ def search():
                                         all_rg_procs.append(rg_proc)
                                         if not supports_label:
                                             _proc_label_map[rg_proc.pid] = label
-                                        bio = io.BytesIO(b)
+                                        dec_proc = subprocess.Popen(
+                                            ['7z', 'x', '-so', full_archive, name],
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE,
+                                            shell=False,
+                                            preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                                        )
+                                        extra_procs_local.append(dec_proc)
                                         try:
-                                            shutil.copyfileobj(bio, rg_proc.stdin)
+                                            lower = name.lower()
+                                            if is_excel_file(lower):
+                                                spool_stream_to_temp_then_stream_excel(lower, dec_proc.stdout, rg_proc.stdin)
+                                            elif is_csv_file(lower):
+                                                stream_csv_fileobj_to_writer(dec_proc.stdout, rg_proc.stdin)
+                                            else:
+                                                copy_fileobj_chunked(dec_proc.stdout, rg_proc.stdin)
                                         except Exception:
                                             pass
                                         try:
                                             rg_proc.stdin.close()
                                         except Exception:
                                             pass
-                                        total_files += 1
+                                        try:
+                                            dec_proc.stdout.close()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            dec_proc.wait()
+                                        except Exception:
+                                            pass
                                     except Exception:
                                         continue
-                            streamed = True
-                        except Exception:
-                            streamed = False
+                                streamed_local = True
+                            except Exception:
+                                streamed_local = False
+                        streamed = streamed_local
+                    # 7z 优先使用 7z CLI 逐成员流式；若不可用则回退 py7zr
+                    elif alc.endswith('.7z'):
+                        streamed_local = False
+                        if has_cmd('7z'):
+                            try:
+                                names = list_7z_members(full_archive)
+                                for name in names:
+                                    label = os.path.relpath(full_archive, data_dir) + '/' + name
+                                    supports_label = check_rg_supports_label()
+                                    if supports_label:
+                                        cmd = rg_base.copy() + ['-a', '--label', label, '--', keyword, '-']
+                                    else:
+                                        cmd = rg_base.copy() + ['-a', '--', keyword, '-']
+                                    try:
+                                        rg_proc = subprocess.Popen(
+                                            cmd,
+                                            stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT,
+                                            shell=False,
+                                            preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                                        )
+                                        extra_procs_local.append(rg_proc)
+                                        all_rg_procs.append(rg_proc)
+                                        if not supports_label:
+                                            _proc_label_map[rg_proc.pid] = label
+                                        dec_proc = subprocess.Popen(
+                                            ['7z', 'x', '-so', full_archive, name],
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE,
+                                            shell=False,
+                                            preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                                        )
+                                        extra_procs_local.append(dec_proc)
+                                        try:
+                                            lower = name.lower()
+                                            if is_excel_file(lower):
+                                                spool_stream_to_temp_then_stream_excel(lower, dec_proc.stdout, rg_proc.stdin)
+                                            elif is_csv_file(lower):
+                                                stream_csv_fileobj_to_writer(dec_proc.stdout, rg_proc.stdin)
+                                            else:
+                                                copy_fileobj_chunked(dec_proc.stdout, rg_proc.stdin)
+                                        except Exception:
+                                            pass
+                                        try:
+                                            rg_proc.stdin.close()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            dec_proc.stdout.close()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            dec_proc.wait()
+                                        except Exception:
+                                            pass
+                                    except Exception:
+                                        continue
+                                streamed_local = True
+                            except Exception:
+                                streamed_local = False
+                        if not streamed_local:
+                            try:
+                                import py7zr
+                                with py7zr.SevenZipFile(full_archive, mode='r') as z:
+                                    names = []
+                                    try:
+                                        names = z.getnames()
+                                    except Exception:
+                                        names = []
+                                    for name in names:
+                                        if not name:
+                                            continue
+                                        label = os.path.relpath(full_archive, data_dir) + '/' + name
+                                        supports_label = check_rg_supports_label()
+                                        if supports_label:
+                                            cmd = rg_base.copy() + ['-a', '--label', label, '--', keyword, '-']
+                                        else:
+                                            cmd = rg_base.copy() + ['-a', '--', keyword, '-']
+                                        try:
+                                            rg_proc = subprocess.Popen(
+                                                cmd,
+                                                stdin=subprocess.PIPE,
+                                                stdout=subprocess.PIPE,
+                                                stderr=subprocess.STDOUT,
+                                                shell=False,
+                                                preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
+                                            )
+                                            extra_procs_local.append(rg_proc)
+                                            all_rg_procs.append(rg_proc)
+                                            if not supports_label:
+                                                _proc_label_map[rg_proc.pid] = label
+                                            # Read single member data
+                                            try:
+                                                dm = z.read([name])
+                                                obj = dm.get(name)
+                                                if obj is None:
+                                                    raise Exception('py7zr read returned None')
+                                                lower = name.lower()
+                                                if is_excel_file(lower):
+                                                    bio = io.BytesIO(obj if isinstance(obj, (bytes, bytearray)) else (obj.getvalue() if hasattr(obj, 'getvalue') else obj.read()))
+                                                    spool_stream_to_temp_then_stream_excel(lower, bio, rg_proc.stdin)
+                                                elif is_csv_file(lower):
+                                                    if isinstance(obj, (bytes, bytearray)):
+                                                        data_bytes = bytes(obj)
+                                                        rg_proc.stdin.write(data_bytes)
+                                                        if len(data_bytes) == 0 or data_bytes[-1] != 0x0A:
+                                                            try:
+                                                                rg_proc.stdin.write(b'\n')
+                                                            except Exception:
+                                                                pass
+                                                    else:
+                                                        stream_csv_fileobj_to_writer(obj, rg_proc.stdin)
+                                                else:
+                                                    if isinstance(obj, (bytes, bytearray)):
+                                                        bio = io.BytesIO(bytes(obj))
+                                                        copy_fileobj_chunked(bio, rg_proc.stdin)
+                                                    else:
+                                                        copy_fileobj_chunked(obj, rg_proc.stdin)
+                                            except Exception:
+                                                pass
+                                            try:
+                                                rg_proc.stdin.close()
+                                            except Exception:
+                                                pass
+                                            total_files += 1
+                                        except Exception:
+                                            continue
+                                streamed_local = True
+                            except Exception:
+                                streamed_local = False
+                        streamed = streamed_local
                 except Exception:
                     streamed = False
 
@@ -960,18 +1577,46 @@ def search():
                         )
                         extra_procs_local.append(decompressor_proc)
                         extra_procs.append(decompressor_proc)
-                        start_rg_for_path('-', stdin_pipe=decompressor_proc.stdout, label=rel_label)
+                        inner_lower = strip_single_compress_ext(fn_lower)
+                        if is_excel_file(inner_lower):
+                            def feed_fn(w, proc=decompressor_proc, name=inner_lower):
+                                data = proc.stdout.read() if proc.stdout else b''
+                                stream_excel_bytes_to_writer(name, data, w)
+                            start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                        else:
+                            start_rg_for_path('-', stdin_pipe=decompressor_proc.stdout, label=rel_label)
                     except FileNotFoundError:
+                        inner_lower = strip_single_compress_ext(fn_lower)
+                        if is_excel_file(inner_lower):
+                            def feed_fn(w, p=full, e=fn_lower, inner=inner_lower):
+                                bio = io.BytesIO()
+                                python_decompress_feed(p, e, bio)
+                                data = bio.getvalue()
+                                stream_excel_bytes_to_writer(inner, data, w)
+                            start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                        else:
+                            def feed_fn(w, p=full, e=fn_lower):
+                                python_decompress_feed(p, e, w)
+                            start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                else:
+                    inner_lower = strip_single_compress_ext(fn_lower)
+                    if is_excel_file(inner_lower):
+                        def feed_fn(w, p=full, e=fn_lower, inner=inner_lower):
+                            bio = io.BytesIO()
+                            python_decompress_feed(p, e, bio)
+                            data = bio.getvalue()
+                            stream_excel_bytes_to_writer(inner, data, w)
+                        try:
+                            start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                        except Exception:
+                            continue
+                    else:
                         def feed_fn(w, p=full, e=fn_lower):
                             python_decompress_feed(p, e, w)
-                        start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
-                else:
-                    def feed_fn(w, p=full, e=fn_lower):
-                        python_decompress_feed(p, e, w)
-                    try:
-                        start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
-                    except Exception:
-                        continue
+                        try:
+                            start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                        except Exception:
+                            continue
 
             # 新增：对每个 excel 文件做流式转换并交给 rg（不落盘）
             for full in excel_files:
@@ -1090,14 +1735,7 @@ def search():
                     try:
                         obj = json.loads(line)
                     except Exception:
-                        raw_text = line.strip()
-                        if raw_text:
-                            # 如果 rg 不支持 --label，我们可以在这里用 pid->label 映射补上显示（简单前缀）
-                            label = _proc_label_map.get(owner)
-                            if label:
-                                raw_text = f"[{label}] {raw_text}"
-                            buf.append(raw_text)
-                            socketio.emit('message', {'message': raw_text + '\n'})
+                        # 非 JSON 行（通常为外部解压/提示），忽略以保持纯净内容输出
                         continue
 
                     typ = obj.get('type')
@@ -1109,15 +1747,8 @@ def search():
                                 obj['data']['path'] = {'text': _proc_label_map.get(owner)}
                             except Exception:
                                 pass
-                        # increment files_done when a new file begins
-                        files_done += 1
-                        # send progress update with files_done (no 'current' field)
-                        socketio.emit('progress', {
-                            'matches': match_count,
-                            'files_total': total_files,
-                            'files_done': files_done
-                        })
-                        # reset local buffers for this file
+                        # 本次文件开始时不增加 files_done，保持以文件结束为准
+                        # 重置本文件缓冲
                         before_lines = []
                         after_lines = []
                         block_main = None
@@ -1140,10 +1771,44 @@ def search():
                         after_lines = []
                         block_ready = True
                     elif typ == 'end':
+                        # Flush any pending block with padded empty lines at file boundary
+                        if block_ready:
+                            block = []
+                            for i in range(context_before_n):
+                                block.append(before_lines[i] if i < len(before_lines) else '')
+                            block.append(block_main if block_main else '')
+                            for i in range(context_after_n):
+                                block.append(after_lines[i] if i < len(after_lines) else '')
+                            out_block = '\n'.join(block)
+                            if out_block.strip():
+                                if not first_block:
+                                    buf.append('')
+                                    socketio.emit('message', {'message': '\n'})
+
+                                buf.append(out_block)
+                                socketio.emit('message', {'message': out_block + '\n'})
+                                match_count += 1
+                                socketio.emit('progress', {
+                                    'matches': match_count,
+                                    'files_total': total_files,
+                                    'files_done': files_done
+                                })
+                                first_block = False
+                            else:
+                                socketio.emit('message', {'message': '\n'})
+                            block_ready = False
+                        # reset buffers at end of file
                         before_lines = []
                         after_lines = []
                         block_main = None
                         block_ready = False
+                        # 文件结束：更新完成数并推送进度
+                        files_done += 1
+                        socketio.emit('progress', {
+                            'matches': match_count,
+                            'files_total': total_files,
+                            'files_done': files_done
+                        })
 
                     # 输出区块（每次命中后，等下文收集够了再输出）
                     if block_ready and (len(after_lines) >= context_after_n):
@@ -1159,10 +1824,6 @@ def search():
                             if not first_block:
                                 buf.append('')
                                 socketio.emit('message', {'message': '\n'})
-                            # 如果 rg 不支持 --label，则在输出前用 proc map 补上文件标签（否则 rg 本身会在 json 中带 label）
-                            label = _proc_label_map.get(owner)
-                            if label:
-                                out_block = f"[{label}]\n" + out_block
                             buf.append(out_block)
                             socketio.emit('message', {'message': out_block + '\n'})
                             match_count += 1
