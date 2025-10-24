@@ -2216,20 +2216,35 @@ def search():
             try:
                 for p in extra_procs_local:
                     try:
-                        p.wait(timeout=0.1)
+                        # 给进程更多时间自然完成，特别是对于7z等大文件处理
+                        p.wait(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        # 如果进程超时，再尝试温和终止
+                        try:
+                            if hasattr(p, 'terminate'):
+                                p.terminate()
+                                p.wait(timeout=2.0)
+                        except Exception:
+                            pass
                     except Exception:
                         pass
             except Exception:
                 pass
 
+            # 只有真正无法结束的进程才强制终止
             for p in list(extra_procs_local):
                 try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                    if hasattr(p, 'poll') and p.poll() is None:
+                        # 进程仍在运行，强制终止
+                        try:
+                            os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                        except Exception:
+                            try:
+                                p.terminate()
+                            except Exception:
+                                pass
                 except Exception:
-                    try:
-                        p.terminate()
-                    except Exception:
-                        pass
+                    pass
 
             # 合并到全局 extra_procs 便于 cancel
             for p in extra_procs_local:
@@ -2263,6 +2278,12 @@ def search():
             except Exception as e:
                 with app.app_context():
                     socketio.emit('message', {'message': f'?? Save failed: {e}\n'})
+
+            # 确保所有进程都已完成，特别是对于7z等大文件处理
+            try:
+                time.sleep(0.5)
+            except Exception:
+                pass
 
             with app.app_context():
                 if not cancel_requested:
