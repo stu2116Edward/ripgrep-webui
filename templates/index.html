@@ -386,14 +386,11 @@ let lastProgressAt = 0;
 const PROGRESS_THROTTLE_MS = 120;
 
 socket.on('progress', data => {
-    if (!data) return;
-    // 如果已触发取消，则静默忽略非取消阶段的进度事件，避免状态被反向覆盖
-    if (wasCancelled && (!data.phase || data.phase !== 'cancelled')) {
-        return;
-    }
-    // 更新计数
+    // 更新计数 - 使用后端提供的累积总数
     if (typeof data.matches === 'number') {
-        matches = data.matches;
+        matches = data.matches;  // 后端已经累积了所有文件的匹配数
+        // 立即更新匹配数显示，确保用户看到最新的累积结果
+        document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
     }
     if (typeof data.files_total === 'number') {
         files_total = data.files_total;
@@ -401,7 +398,10 @@ socket.on('progress', data => {
     if (typeof data.files_done === 'number') {
         files_done = data.files_done;
     }
-    // 毫秒级分阶段计时
+    // 更新文件类型与耗时（如提供）
+    if (data.file_type) {
+        fileType = data.file_type;
+    }
     if (typeof data.elapsed_ms === 'number') {
         processingMs = data.elapsed_ms;
     }
