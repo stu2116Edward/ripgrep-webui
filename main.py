@@ -1395,7 +1395,34 @@ def search():
             else:
                 # single normal file: count as 1
                 total_files = 1
-                start_rg_for_path(search_path)
+                # 对于非压缩/归档/Excel 的单文件，使用 stdin 流式喂入并按字节上报进度
+                try:
+                    rel_label = os.path.relpath(search_path, data_dir)
+                except Exception:
+                    rel_label = os.path.basename(search_path)
+                file_lower = file.lower()
+                if (not is_single_file_compressed(file_lower)) and (not is_archive_multi_file(file_lower)) and (not is_excel_file(file_lower)):
+                    def feed_fn(w, p=search_path, lb=rel_label, fl=file_lower):
+                        size_c = None
+                        try:
+                            size_c = os.path.getsize(p)
+                        except Exception:
+                            size_c = None
+                        ft = classify_file_type(fl)
+                        def _cb(done, total, elapsed_ms, ft_local=ft, lb_local=lb):
+                            emit_progress_ex(
+                                phase='scan', file_type=ft_local,
+                                elapsed_ms=elapsed_ms, bytes_done=done, bytes_total=total,
+                                label=lb_local
+                            )
+                        try:
+                            with open(p, 'rb') as f:
+                                copy_fileobj_chunked(f, w, progress_cb=_cb, bytes_total=size_c)
+                        except Exception:
+                            pass
+                    start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                else:
+                    start_rg_for_path(search_path)
         else:
             # Directory search (default) -> include compressed, archives and excel
             non_excluded_count = 0
@@ -1996,6 +2023,7 @@ def search():
                 first_block = True
                 # 搜索阶段计时（毫秒级）
                 search_start_ns = {}
+                last_progress_tick_ns = 0
 
                 # 发送初始匹配数和总文件数（files_total）
                 try:
@@ -2020,6 +2048,15 @@ def search():
                                 break
                         if all_ended and q.empty():
                             break
+                        # 空闲心跳：周期性推送耗时与累计状态（约每200ms一次）
+                        try:
+                            now_ns = time.perf_counter_ns()
+                            if last_progress_tick_ns == 0 or (now_ns - last_progress_tick_ns) >= 200_000_000:
+                                elapsed_ms_total = int((now_ns - request_start_ns) / 1_000_000)
+                                emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
+                                last_progress_tick_ns = now_ns
+                        except Exception:
+                            pass
                         continue
 
                     if raw_item is None:
