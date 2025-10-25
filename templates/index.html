@@ -241,6 +241,7 @@ function setProgressState(state, opts = {}) {
         badge.className = 'badge badge-success progress-status-badge';
         badge.textContent = '完成';
         detail.textContent = `时间：${processingMs} ms`;
+        // 确保显示最新的匹配数（可能已在progress事件中更新）
         matchEl.textContent = `匹配：${matches} 条`;
         percent.textContent = '100%';
         const sp = document.getElementById('loadingSpinner');
@@ -527,8 +528,11 @@ function clearResult() {
     try {
         const res = document.getElementById('result');
         if (res) res.textContent = '';
-        // 仅清除界面显示内容，不改变任何运行/计数状态
-        // 不重置 matches/files_total/files_done/receivedChunks，不操作进度条
+        // 清空结果时同时重置匹配数显示为0
+        matches = 0;
+        document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
+        // 仅清除界面显示内容，不改变其他运行/计数状态
+        // 不重置 files_total/files_done/receivedChunks，不操作进度条
     } catch (e) {
         // 静默处理前端清空异常，避免影响其他操作
         console.warn('clearResult error:', e);
