@@ -55,6 +55,7 @@
         }
         /* Smooth progress bar animation */
         #progressBar { transition: width 220ms ease-in-out; }
+        .no-transition { transition: none !important; }
 
         /* match display under title */
         #matchDisplay {
@@ -215,6 +216,7 @@ function setProgressState(state, opts = {}) {
     if (state === 'idle') {
         bar.style.width = '0%';
         bar.className = 'progress-bar';
+        bar.classList.remove('no-transition');
         badge.className = 'badge badge-secondary progress-status-badge';
         badge.textContent = '空闲';
         detail.textContent = '时间：0 ms';
@@ -226,6 +228,7 @@ function setProgressState(state, opts = {}) {
         let pct = typeof opts.pct === 'number' ? opts.pct : 5;
         // 超过 100% 自动修正
         pct = Math.max(0, Math.min(100, pct));
+        bar.classList.remove('no-transition');
         bar.style.width = pct + '%';
         bar.className = 'progress-bar progress-bar-striped progress-bar-animated bg-info';
         badge.className = 'badge badge-info progress-status-badge';
@@ -236,8 +239,20 @@ function setProgressState(state, opts = {}) {
         const sp = document.getElementById('loadingSpinner');
         if (sp) sp.style.display = 'inline-block';
     } else if (state === 'done') {
+        // 压缩/归档完成时：禁用宽度过渡，瞬时显示 100%
+        if (opts && (opts.fileType === 'compressed' || opts.fileType === 'archive')) {
+            bar.classList.add('no-transition');
+        } else {
+            bar.classList.remove('no-transition');
+        }
         bar.style.width = '100%';
-        bar.className = 'progress-bar bg-success';
+        if (opts && opts.preserveBarStyle) {
+            // 保留原有进度条风格，仅把颜色改为绿色，避免视觉上的“切换”
+            bar.classList.remove('bg-info');
+            bar.classList.add('bg-success');
+        } else {
+            bar.className = 'progress-bar bg-success';
+        }
         badge.className = 'badge badge-success progress-status-badge';
         badge.textContent = '完成';
         detail.textContent = `时间：${processingMs} ms`;
@@ -353,7 +368,7 @@ socket.on('message', data => {
         if (wasCancelled) { return; }
         running = false;
         pendingSubmit = false;
-        setProgressState('done');
+        setProgressState('done', {fileType, preserveBarStyle: (fileType === 'compressed')});
         disableControls(false);
         document.getElementById('submitBtn').disabled = false;
         clearTimeout(progressHideTimeout);
@@ -426,14 +441,37 @@ socket.on('progress', data => {
         const total = Math.max(done, data.bytes_total || done);
         pct = total > 0 ? Math.floor((done / total) * 100) : 0;
     } else if (files_total && files_total > 0) {
-        pct = Math.floor((files_done / files_total) * 100);
+        if (files_total === 1 && files_done === 0) {
+            const fallbackChunks = Math.min(95, 5 + Math.floor(receivedChunks * 2));
+            const fallbackTime   = Math.min(95, 5 + Math.floor(processingMs / 150));
+            pct = Math.max(fallbackChunks, fallbackTime, 0);
+        } else {
+            pct = Math.floor((files_done / files_total) * 100);
+        }
     } else {
         pct = Math.min(95, 5 + Math.floor(receivedChunks * 2));
     }
-    // clamp
-    pct = running ? Math.min(99, Math.max(0, pct)) : Math.min(100, Math.max(0, pct));
+    // clamp：运行中允许字节或文件完成达到 100%，否则最多 99%
+    const reachedByteCompletion = (typeof data.bytes_done === 'number' && typeof data.bytes_total === 'number' && data.bytes_total > 0 && data.bytes_done >= data.bytes_total);
+    const reachedFileCompletion = (files_total > 0 && files_done >= files_total);
+    if (running && !(reachedByteCompletion || reachedFileCompletion)) {
+        pct = Math.min(99, Math.max(0, pct));
+    } else {
+        pct = Math.min(100, Math.max(0, pct));
+    }
 
-    // 节流更新 UI
+    // 新增：达到完成条件时立即切换为完成态（不受节流）
+    if (reachedFileCompletion || ((fileType === 'compressed' || fileType === 'archive') && reachedByteCompletion)) {
+        running = false;
+        setProgressState('done', {fileType, preserveBarStyle: (fileType === 'compressed')});
+        disableControls(false);
+        document.getElementById('submitBtn').disabled = false;
+        clearTimeout(progressHideTimeout);
+        progressHideTimeout = setTimeout(() => hideProgress(), 1200);
+        return;
+    }
+
+    // 节流更新 UI（仅运行态）
     const now = Date.now();
     if (now - lastProgressAt >= PROGRESS_THROTTLE_MS) {
         lastProgressAt = now;
