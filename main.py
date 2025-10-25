@@ -2285,6 +2285,13 @@ def search():
             except Exception:
                 pass
 
+            # 在发送完成消息前，再次发送最终匹配数，确保前端收到
+            try:
+                elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
+            except Exception:
+                elapsed_ms_total = 0
+            emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
+
             with app.app_context():
                 if not cancel_requested:
                     socketio.emit('message', {'message': '?????? Done ??????\n'})
