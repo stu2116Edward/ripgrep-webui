@@ -10,6 +10,9 @@ COPY requirements.txt .
 # 安装依赖
 RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
+# 安装 7z 等系统工具以支持无落盘流式处理 .rar/.7z
+RUN apt-get update && apt-get install -y --no-install-recommends p7zip-full libarchive-tools unzip && rm -rf /var/lib/apt/lists/*
+
 # 创建必要的目录结构
 RUN mkdir -p templates exports
 
