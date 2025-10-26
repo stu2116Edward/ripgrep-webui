@@ -40,9 +40,7 @@ def emit_progress_ex(phase=None, file_type=None, elapsed_ms=None,
             payload['phase'] = str(phase)
         if file_type:
             payload['file_type'] = str(file_type)
-        if elapsed_ms is not None:
-            # 毫秒级别精度（整数毫秒）
-            payload['elapsed_ms'] = int(elapsed_ms)
+    
         if bytes_done is not None:
             try:
                 bd = int(bytes_done)
