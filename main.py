@@ -40,7 +40,7 @@ def emit_progress_ex(phase=None, file_type=None, elapsed_ms=None,
             payload['phase'] = str(phase)
         if file_type:
             payload['file_type'] = str(file_type)
-    
+        # elapsed_ms disabled: stop sending time to frontend
         if bytes_done is not None:
             try:
                 bd = int(bytes_done)
