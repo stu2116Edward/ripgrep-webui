@@ -2,9 +2,9 @@
 <html>
 <head>
     <title>文件内容检索系统</title>
-    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.3.1/css/bootstrap.min.css ">
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.3.1/css/bootstrap.min.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js "></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <style>
         html, body { height: 100%; }
         .container { height: 100%; }
@@ -68,6 +68,24 @@
         @media (max-width: 576px) {
             .progress-label { min-width: 100px; font-size: 0.85rem; }
         }
+
+        /* File name and percentage display styling */
+        .progress-footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 4px;
+            font-size: 0.85rem;
+            color: #6c757d;
+        }
+        #fileNameDisplay {
+            font-size: 0.85rem;
+            color: #6c757d;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 70%;
+        }
     </style>
 </head>
 <body>
@@ -91,7 +109,9 @@
                         <input type="number" id="context_after" class="form-control" placeholder="下文" min="0">
                     </div>
                     <div class="col-12 col-md-3 mt-2 mt-md-0">
-                        <select id="file" class="form-control"></select>
+                        <select id="file" class="form-control">
+                            <option value="__ALL__" selected>检索全部文件</option>
+                        </select>
                     </div>
                 </div>
                 <div class="row mt-3 g-2">
@@ -121,8 +141,9 @@
                             <div class="progress" style="height:12px;">
                                 <div id="progressBar" class="progress-bar" role="progressbar" style="width: 0%;" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
                             </div>
-                            <div class="d-flex justify-content-between mt-1" style="font-size:0.85rem;color:#6c757d;">
-                                <div id="progressDetail">已接收：0 块 / 0 文件</div>
+                            <!-- File name and percentage display area -->
+                            <div class="progress-footer">
+                                <div id="fileNameDisplay"></div>
                                 <div id="progressPercent">0%</div>
                             </div>
                         </div>
@@ -146,14 +167,11 @@ let matches = 0;
 let files_total = 0;
 let files_done = 0;
 let progressHideTimeout = null;
-// 动态文件类型与计时
 let fileType = 'other';
-// removed processingMs
-// 终止控制器与跟踪中的请求集合
 let searchController = null;
 const inflightControllers = new Set();
-// 新增：标记是否发生过取消，避免后续 Done 误覆盖
 let wasCancelled = false;
+let currentFileName = '';
 
 function classifyFileType(nameLower) {
     const n = (nameLower || '').toLowerCase();
@@ -165,17 +183,13 @@ function classifyFileType(nameLower) {
     if (/(\.txt|\.log|\.json|\.xml|\.md|\.ini|\.yaml|\.yml)$/i.test(n)) return 'text';
     return 'other';
 }
-// removed updateFileTypeUI (unused)
 
 function showProgress() {
-    const wrap = document.getElementById('progressWrap');
-    wrap.style.display = 'flex';
+    document.getElementById('progressWrap').style.display = 'flex';
 }
 function hideProgress() {
-    const wrap = document.getElementById('progressWrap');
-    wrap.style.display = 'none';
+    document.getElementById('progressWrap').style.display = 'none';
 }
-// 统一跟踪中的 Fetch，支持取消时全部终止
 function trackedFetch(url, options = {}, track = true) {
     const controller = new AbortController();
     const opts = Object.assign({}, options, { signal: controller.signal });
@@ -191,12 +205,12 @@ function cancelAllFetches() {
     inflightControllers.clear();
 }
 function setProgressState(state, opts = {}) {
-    // state: 'idle' | 'running' | 'done' | 'cancelled' | 'error'
     const bar = document.getElementById('progressBar');
     const badge = document.getElementById('progressBadge');
     const detail = document.getElementById('progressDetail');
     const percent = document.getElementById('progressPercent');
     const matchEl = document.getElementById('matchDisplay');
+    const fileNameEl = document.getElementById('fileNameDisplay');
 
     if (state === 'idle') {
         bar.style.width = '0%';
@@ -204,14 +218,15 @@ function setProgressState(state, opts = {}) {
         bar.classList.remove('no-transition');
         badge.className = 'badge badge-secondary progress-status-badge';
         badge.textContent = '空闲';
-        detail.textContent = '';
+        if (detail) detail.textContent = '';
         percent.textContent = '0%';
+        fileNameEl.textContent = '';
+        currentFileName = '';
         const sp = document.getElementById('loadingSpinner');
         if (sp) sp.style.display = 'none';
     } else if (state === 'running') {
         showProgress();
-        let pct = typeof opts.pct === 'number' ? opts.pct : 5;
-        // 超过 100% 自动修正
+        let pct = typeof opts.pct === 'number' ? opts.pct : 0;
         pct = Math.max(0, Math.min(100, pct));
         bar.classList.remove('no-transition');
         bar.style.width = pct + '%';
@@ -219,11 +234,14 @@ function setProgressState(state, opts = {}) {
         badge.className = 'badge badge-info progress-status-badge';
         badge.textContent = opts.text || '检索中';
         matchEl.textContent = `匹配：${matches} 条`;
-        percent.textContent = (pct) + '%';
+        percent.textContent = pct + '%';
+        if (opts.file) {
+            currentFileName = opts.file;
+            fileNameEl.textContent = `正在检索：${opts.file}`;
+        }
         const sp = document.getElementById('loadingSpinner');
         if (sp) sp.style.display = 'inline-block';
     } else if (state === 'done') {
-        // 压缩/归档完成时：禁用宽度过渡，瞬时显示 100%
         if (opts && (opts.fileType === 'compressed' || opts.fileType === 'archive')) {
             bar.classList.add('no-transition');
         } else {
@@ -231,7 +249,6 @@ function setProgressState(state, opts = {}) {
         }
         bar.style.width = '100%';
         if (opts && opts.preserveBarStyle) {
-            // 保留原有进度条风格，仅把颜色改为绿色，避免视觉上的“切换”
             bar.classList.remove('bg-info');
             bar.classList.add('bg-success');
         } else {
@@ -239,7 +256,6 @@ function setProgressState(state, opts = {}) {
         }
         badge.className = 'badge badge-success progress-status-badge';
         badge.textContent = '完成';
-        // 确保显示最新的匹配数（可能已在progress事件中更新）
         matchEl.textContent = `匹配：${matches} 条`;
         percent.textContent = '100%';
         const sp = document.getElementById('loadingSpinner');
@@ -251,6 +267,8 @@ function setProgressState(state, opts = {}) {
         badge.textContent = '已取消';
         matchEl.textContent = `匹配：${matches} 条`;
         percent.textContent = '已取消';
+        fileNameEl.textContent = '';
+        currentFileName = '';
         const sp = document.getElementById('loadingSpinner');
         if (sp) sp.style.display = 'none';
     } else if (state === 'error') {
@@ -259,35 +277,24 @@ function setProgressState(state, opts = {}) {
         bar.className = 'progress-bar bg-warning';
         badge.className = 'badge badge-warning progress-status-badge';
         badge.textContent = '错误';
-        detail.textContent = opts.msg || '出现错误';
+        if (detail) detail.textContent = opts.msg || '出现错误';
         percent.textContent = '错误';
+        fileNameEl.textContent = '';
+        currentFileName = '';
         const sp = document.getElementById('loadingSpinner');
         if (sp) sp.style.display = 'none';
     }
 }
 
 function disableControls(val) {
-    // 提交按钮可按运行态控制；其他控件在任何情况下都保持可用
     const submitBtn = document.getElementById('submitBtn');
     if (submitBtn) submitBtn.disabled = val;
-
     const cancelBtn = document.getElementById('cancelBtn');
     if (cancelBtn) cancelBtn.disabled = false;
-
     const clearBtn = document.getElementById('clearBtn');
     if (clearBtn) clearBtn.disabled = false;
-
     const exportBtn = document.getElementById('exportBtn');
     if (exportBtn) exportBtn.disabled = false;
-
-    const fileSel = document.getElementById('file');
-    if (fileSel) fileSel.disabled = false;
-
-    const ctxBefore = document.getElementById('context_before');
-    if (ctxBefore) ctxBefore.disabled = false;
-
-    const ctxAfter = document.getElementById('context_after');
-    if (ctxAfter) ctxAfter.disabled = false;
 }
 
 window.addEventListener('DOMContentLoaded', function(){
@@ -296,26 +303,14 @@ window.addEventListener('DOMContentLoaded', function(){
     .then(list => {
         const sel = document.getElementById('file');
         if (Array.isArray(list) && list.length > 0) {
-            const ph = document.createElement('option');
-            ph.value = '';
-            ph.textContent = '请选择文件';
-            ph.disabled = true;
-            ph.selected = true;
-            sel.appendChild(ph);
             list.forEach(fn => {
                 const opt = document.createElement('option');
                 opt.value = fn; opt.textContent = fn;
                 sel.appendChild(opt);
             });
-        } else {
-            // 目录为空时保持下拉为空
         }
     }).catch(() => {});
-    // init progress idle
     setProgressState('idle');
-    // 取消按钮保持可点击，随时允许中断（移除初始禁用）
-    document.getElementById('cancelBtn').disabled = false;
-    // 绑定取消按钮事件监听器（统一使用 addEventListener）
     const cancelBtnEl = document.getElementById('cancelBtn');
     cancelBtnEl.addEventListener('click', function(e){
         e.preventDefault();
@@ -327,9 +322,8 @@ socket.on('message', data => {
     if (!data || typeof data.message !== 'string') return;
     const text = data.message.replace(/\r?\n/g, '\n');
 
-    // 取消：恢复所有控件与状态（若有新提交挂起则忽略旧取消事件）
     if (text.includes('??? Cancelled ???')) {
-        if (pendingSubmit) { return; }
+        if (pendingSubmit) return;
         running = false;
         pendingSubmit = false;
         wasCancelled = true;
@@ -341,25 +335,22 @@ socket.on('message', data => {
         return;
     }
 
-    // 服务端已开始检索：仅在当前有挂起提交时响应，避免旧事件锁控件
     if (text.includes('Started')) {
-        if (!pendingSubmit) { return; }
+        if (!pendingSubmit) return;
         running = true;
         pendingSubmit = false;
         wasCancelled = false;
         receivedChunks = 0;
-        matches = 0; // 每次新启动重置匹配显示
+        matches = 0;
         files_total = 0;
         files_done = 0;
-        // removed processingMs reset
         document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
-        setProgressState('running', {pct:5, text: '开始检索'});
+        setProgressState('running', {pct:0, text: '开始检索'});
         disableControls(true);
         document.getElementById('cancelBtn').disabled = false;
         return;
     }
 
-    // 服务端忙：提示并恢复按钮（防止长时间不可点击）
     if (text.includes('Busy')) {
         pendingSubmit = false;
         setProgressState('error', {msg: '服务器忙，请稍后再试'});
@@ -370,64 +361,43 @@ socket.on('message', data => {
         return;
     }
 
-    // 完成：退出运行态并恢复控件（若有新提交挂起则忽略旧完成事件）
     if (text.includes('Done')) {
-        if (pendingSubmit) { return; }
-        if (wasCancelled) { return; }
+        if (pendingSubmit) return;
+        if (wasCancelled) return;
         running = false;
         pendingSubmit = false;
         setProgressState('done', {fileType, preserveBarStyle: (fileType === 'compressed')});
         disableControls(false);
         document.getElementById('submitBtn').disabled = false;
         clearTimeout(progressHideTimeout);
-        progressHideTimeout = setTimeout(() => {
-            hideProgress();
-        }, 1200);
+        progressHideTimeout = setTimeout(() => hideProgress(), 1200);
         return;
     }
 
-    // 静默：屏蔽非文件内容（服务端提示/错误以 "??" 开头）
-    if (/^\s*\?\?/.test(text)) {
-        return;
-    }
+    if (/^\s*\?\?/.test(text)) return;
 
-    // 普通输出：仅在有内容时写入结果并计数（避免空行增加块数）
     if (text.trim().length > 0) {
         document.getElementById('result').textContent = text + document.getElementById('result').textContent;
         receivedChunks++;
-        // 仅更新明细，不在此处重绘进度百分比，避免与 progress 事件打架
     } else {
-        // 保留分隔空行但不计块数
         document.getElementById('result').textContent = text + document.getElementById('result').textContent;
     }
 });
 
-// 监听后端 progress 事件（包含 matches, files_total, files_done）
-// 进度节流（避免频繁 DOM 更新卡顿）
 let lastProgressAt = 0;
 const PROGRESS_THROTTLE_MS = 120;
 
 socket.on('progress', data => {
-    // 更新计数 - 使用后端提供的累积总数
-    if (typeof data.matches === 'number') {
-        matches = data.matches;  // 后端已经累积了所有文件的匹配数
-        // 立即更新匹配数显示，确保用户看到最新的累积结果
+    // 只在单文件检索时更新匹配数，多文件检索时由sendKeyword函数控制
+    if (typeof data.matches === 'number' && document.getElementById('file').value !== '__ALL__') {
+        matches = data.matches;
         document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
     }
-    if (typeof data.files_total === 'number') {
-        files_total = data.files_total;
-    }
-    if (typeof data.files_done === 'number') {
-        files_done = data.files_done;
-    }
-    // 更新文件类型与耗时（如提供）
-    if (data.file_type) {
-        fileType = data.file_type;
-    }
-    // elapsed_ms removed
+    if (typeof data.files_total === 'number') files_total = data.files_total;
+    if (typeof data.files_done === 'number') files_done = data.files_done;
+    if (data.file_type) fileType = data.file_type;
     if (data && data.phase === 'cancelled') {
-        // 若有新提交挂起，忽略旧取消事件，避免状态回退
-        if (pendingSubmit) { return; }
+        if (pendingSubmit) return;
         running = false;
         pendingSubmit = false;
         wasCancelled = true;
@@ -440,7 +410,6 @@ socket.on('progress', data => {
     if (data && data.phase === 'error') {
         setProgressState('error', {msg: '出现错误'});
     }
-    // 单进度条：优先根据字节进度（解压阶段）；否则按文件进度
     let pct = 0;
     if (typeof data.bytes_done === 'number') {
         const done = Math.max(0, data.bytes_done || 0);
@@ -448,15 +417,14 @@ socket.on('progress', data => {
         pct = total > 0 ? Math.floor((done / total) * 100) : 0;
     } else if (files_total && files_total > 0) {
         if (files_total === 1 && files_done === 0) {
-            const fallbackChunks = Math.min(95, 5 + Math.floor(receivedChunks * 2));
+            const fallbackChunks = Math.min(95, Math.floor(receivedChunks * 2));
             pct = Math.max(fallbackChunks, 0);
         } else {
             pct = Math.floor((files_done / files_total) * 100);
         }
     } else {
-        pct = Math.min(95, 5 + Math.floor(receivedChunks * 2));
+        pct = Math.min(95, Math.floor(receivedChunks * 2));
     }
-    // clamp：运行中允许字节或文件完成达到 100%，否则最多 99%
     const reachedByteCompletion = (typeof data.bytes_done === 'number' && typeof data.bytes_total === 'number' && data.bytes_total > 0 && data.bytes_done >= data.bytes_total);
     const reachedFileCompletion = (files_total > 0 && files_done >= files_total);
     if (running && !(reachedByteCompletion || reachedFileCompletion)) {
@@ -464,8 +432,6 @@ socket.on('progress', data => {
     } else {
         pct = Math.min(100, Math.max(0, pct));
     }
-
-    // 新增：达到完成条件时立即切换为完成态（不受节流）
     if (reachedFileCompletion || ((fileType === 'compressed' || fileType === 'archive') && reachedByteCompletion)) {
         running = false;
         setProgressState('done', {fileType, preserveBarStyle: (fileType === 'compressed')});
@@ -475,8 +441,6 @@ socket.on('progress', data => {
         progressHideTimeout = setTimeout(() => hideProgress(), 1200);
         return;
     }
-
-    // 节流更新 UI（仅运行态）
     const now = Date.now();
     if (now - lastProgressAt >= PROGRESS_THROTTLE_MS) {
         lastProgressAt = now;
@@ -485,86 +449,140 @@ socket.on('progress', data => {
     }
 });
 
-function sendKeyword() {
+async function sendKeyword() {
     const kw = document.getElementById('keyword').value.trim();
-    if (!kw) {
-        alert('请输入关键词后再提交！');
-        return;
-    }
+    if (!kw) { alert('请输入关键词'); return; }
 
-    // 防抖 + 运行中防重复
     const now = Date.now();
-    if (running || pendingSubmit || (now - lastSubmitAt < DEBOUNCE_MS)) {
-        return;
-    }
+    if (running || pendingSubmit || (now - lastSubmitAt < DEBOUNCE_MS)) return;
     lastSubmitAt = now;
     pendingSubmit = true;
-    // 新搜索开始：清除取消标记，避免忽略后续 Started/Progress
     wasCancelled = false;
 
     const before = parseInt(document.getElementById('context_before').value || '0', 10);
     const after  = parseInt(document.getElementById('context_after').value || '0', 10);
-    const file   = document.getElementById('file').value || '';
-    if (!file) {
-        alert('请先选择文件！');
+    const fileSel = document.getElementById('file');
+    const file = fileSel.value;
+
+    if (file === '__ALL__') {
+        const list = await trackedFetch('/files').then(r => r.ok ? r.json() : Promise.reject()).catch(() => []);
+        if (!list.length) { alert('目录中没有可检索文件'); pendingSubmit = false; return; }
+        
+        // 初始化累计匹配数
+        let totalMatches = 0;
+        matches = 0;
+        document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
+        
+        for (const f of list) {
+            if (wasCancelled) break;
+            const fileMatches = await singleSearch(kw, before, after, f);
+            if (typeof fileMatches === 'number') {
+                totalMatches += fileMatches;
+                matches = totalMatches;
+                document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
+            }
+            
+            // 在进行下一个文件检索前添加1秒缓冲时间
+            if (list.indexOf(f) < list.length - 1 && !wasCancelled) {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+        }
+        pendingSubmit = false;
         return;
     }
+    if (!file) { alert('请先选择文件'); pendingSubmit = false; return; }
+    await singleSearch(kw, before, after, file);
+}
 
-    // 更新文件类型 UI
+async function singleSearch(kw, before, after, file) {
     fileType = classifyFileType(file.toLowerCase());
-    // 提交后立即允许取消
-    document.getElementById('cancelBtn').disabled = false;
-
-    // 立即显示进度，但仅暂时禁用提交按钮（其余控件待服务端确认后再禁用）
     receivedChunks = 0;
-    matches = 0; // 新提交重置显示计数
+    let currentFileMatches = 0; // 当前文件的匹配数
     files_total = 0;
     files_done = 0;
-    document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
     showProgress();
-    setProgressState('running', {pct:5, text: '已提交，等待结果...'});
+    setProgressState('running', {pct: 0, text: '检索中', file: file});
     document.getElementById('submitBtn').disabled = true;
 
-    // 使用 AbortController 支持取消当前检索请求
     searchController = new AbortController();
-    fetch('/search', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({keyword: kw, context_before: before, context_after: after, file}),
-        signal: searchController.signal
-    }).catch(err => {
-        // request failed or aborted
-        pendingSubmit = false;
-        running = false;
-        setProgressState('error', {msg: '提交失败'});
-        disableControls(false);
-        document.getElementById('submitBtn').disabled = false;
-        clearTimeout(progressHideTimeout);
-        progressHideTimeout = setTimeout(() => { hideProgress(); }, 1200);
-    });
+    try {
+        const resp = await fetch('/search', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({keyword: kw, context_before: before, context_after: after, file}),
+            signal: searchController.signal
+        });
+        if (!resp.ok) throw new Error('search failed');
+        
+        // 等待搜索完成并获取匹配数
+        await new Promise(resolve => {
+            const onDone = () => { 
+                socket.off('message', handler); 
+                socket.off('progress', progressHandler);
+                resolve(); 
+            };
+            const handler = (data) => {
+                if (data.message && (data.message.includes('Done') || data.message.includes('Cancelled'))) onDone();
+            };
+            const progressHandler = (data) => {
+                if (typeof data.matches === 'number') {
+                    currentFileMatches = data.matches;
+                }
+            };
+            socket.on('message', handler);
+            socket.on('progress', progressHandler);
+        });
+        
+        return currentFileMatches;
+    } catch (e) {
+        // 单条出错继续下一个
+        return 0;
+    }
 }
 
 function cancelSearch() {
-    // 终止所有未完成的请求（不跟踪 /cancel）
-    if (searchController) { try { searchController.abort(); } catch(e){} searchController = null; }
+    console.log('Canceling search...');
+    
+    // Abort any active fetch requests
+    if (searchController) { 
+        try { 
+            searchController.abort(); 
+        } catch(e){
+            console.error('Error aborting search controller:', e);
+        } 
+        searchController = null; 
+    }
+    
+    // Cancel all tracked fetch requests
     cancelAllFetches();
-    // 点击反馈：显示“取消中...”，不禁用取消按钮，确保随时可再次触发
+    
+    // Update UI to show canceling state
     const badge = document.getElementById('progressBadge');
     if (badge) badge.textContent = '取消中...';
     const sp = document.getElementById('loadingSpinner');
     if (sp) sp.style.display = 'inline-block';
-
-    // 请求后端取消
-    fetch('/cancel', {method: 'POST'}).catch(()=>{});
-
-    // 本地 UI 重置
+    
+    // Send cancel request to backend
+    fetch('/cancel', {method: 'POST'})
+        .then(response => {
+            console.log('Cancel request sent successfully');
+        })
+        .catch(error => {
+            console.error('Error sending cancel request:', error);
+        });
+    
+    // Update state
     running = false;
     pendingSubmit = false;
     wasCancelled = true;
+    
+    // Update UI
     setProgressState('cancelled');
     disableControls(false);
     const submitBtn = document.getElementById('submitBtn');
     if (submitBtn) submitBtn.disabled = false;
+    
+    // Hide progress after delay
     clearTimeout(progressHideTimeout);
     progressHideTimeout = setTimeout(() => { hideProgress(); }, 800);
 }
@@ -573,13 +591,9 @@ function clearResult() {
     try {
         const res = document.getElementById('result');
         if (res) res.textContent = '';
-        // 清空结果时同时重置匹配数显示为0
         matches = 0;
         document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
-        // 仅清除界面显示内容，不改变其他运行/计数状态
-        // 不重置 files_total/files_done/receivedChunks，不操作进度条
     } catch (e) {
-        // 静默处理前端清空异常，避免影响其他操作
         console.warn('clearResult error:', e);
     }
 }
@@ -589,10 +603,7 @@ function exportResult() {
                       .split('\n')
                       .filter(line => !line.includes('??? Cancelled ???'))
                       .join('\n');
-    if (!content.trim()) {
-        alert('检索结果为空，无需导出！');
-        return;
-    }
+    if (!content.trim()) { alert('检索结果为空，无需导出！'); return; }
     const kw = document.getElementById('keyword').value.trim().replace(/[^\w\u4e00-\u9fa5\-_ ]/g, '');
     const fn = `${kw || 'search'}_${new Date().toISOString().slice(0,10)}_${Date.now()}.txt`;
     const blob = new Blob([content], {type: 'text/plain'});
