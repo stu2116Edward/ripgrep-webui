@@ -667,10 +667,13 @@ def index():
 @app.route('/search', methods=['POST'])
 def search():
     global proc, extra_procs, temp_dirs, _proc_label_map, cancel_requested
-    cancel_requested = False
+    # Only proceed if no search is currently running
     if proc is not None:
         socketio.emit('message', {'message': '?????? Busy ??????\n'})
         return "Busy"
+    
+    # Reset cancel flag when starting a fresh search
+    cancel_requested = False
 
     data = request.json or {}
     keyword = data.get('keyword', '')
@@ -2036,8 +2039,11 @@ def search():
                     if cancel_requested:
                         break
                     try:
-                        raw_item, owner = q.get(timeout=0.1)
+                        raw_item, owner = q.get(timeout=0.05)  # Reduced timeout for more frequent cancel checks
                     except queue.Empty:
+                        # Check for cancellation more frequently
+                        if cancel_requested:
+                            break
                         # 检查进程是否全部退出并且队列空 => 结束
                         all_ended = True
                         for p in extra_procs_local:
@@ -2080,6 +2086,9 @@ def search():
                     typ = obj.get('type')
                     # handle 'begin' to update files_done
                     if typ == 'begin':
+                        # Check for cancellation before processing
+                        if cancel_requested:
+                            break
                         # 如果 rg 不支持 --label，则尝试注入 label 到 obj 的 path 字段（仅本地使用）
                         if 'data' in obj and 'path' not in obj.get('data', {}) and owner in _proc_label_map:
                             try:
@@ -2098,6 +2107,9 @@ def search():
                         block_main = None
                         block_ready = False
                     elif typ == 'context':
+                        # Check for cancellation before processing
+                        if cancel_requested:
+                            break
                         data = obj.get('data', {})
                         line_text = data.get('lines', {}).get('text', '')
                         line_text = (line_text or '').strip()
@@ -2108,6 +2120,9 @@ def search():
                         else:
                             after_lines.append(line_text)
                     elif typ == 'match':
+                        # Check for cancellation before processing
+                        if cancel_requested:
+                            break
                         data = obj.get('data', {})
                         line_text = data.get('lines', {}).get('text', '')
                         line_text = (line_text or '').strip()
@@ -2349,6 +2364,10 @@ def cancel():
     global proc, extra_procs, temp_dirs, output_buffers, _proc_label_map, cancel_requested
     request_cancel_ns = time.perf_counter_ns()
     cancel_requested = True
+    
+    # Immediately emit cancel message to notify frontend
+    emit_message_utf('??? Cancelled ???\n')
+    emit_progress_ex(phase='cancelled')
 
     # 安全关闭流的辅助函数
     def _close_streams(p):
@@ -2382,7 +2401,9 @@ def cancel():
             if hasattr(p, 'poll') and p.poll() is None:
                 if os.name != 'nt':
                     try:
-                        os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                        # Try to kill the process group first
+                        pgid = os.getpgid(p.pid)
+                        os.killpg(pgid, signal.SIGTERM)
                     except Exception:
                         try:
                             p.terminate()
@@ -2394,10 +2415,14 @@ def cancel():
                         p.terminate()
                     except Exception:
                         pass
+                
+                # Wait a bit for graceful termination
                 try:
-                    p.wait(timeout=0.3)
+                    p.wait(timeout=0.5)
                 except Exception:
                     pass
+                
+                # If still running, force kill
                 if hasattr(p, 'poll') and p.poll() is None:
                     if os.name == 'nt':
                         try:
@@ -2407,7 +2432,12 @@ def cancel():
                             pass
                     else:
                         try:
-                            p.kill()
+                            # Try process group kill first, then individual process
+                            try:
+                                pgid = os.getpgid(p.pid)
+                                os.killpg(pgid, signal.SIGKILL)
+                            except Exception:
+                                p.kill()
                         except Exception:
                             pass
         except Exception:
@@ -2415,13 +2445,14 @@ def cancel():
         # 再次尝试关闭流（终止后）
         _close_streams(p)
 
-    # 1) 主检索进程
-    _terminate_proc(proc)
-
-    # 2) 额外子进程
+    # 1) 首先终止额外子进程（解压器等），然后终止主检索进程
+    # 这样可以更快地停止数据流
     for p in list(extra_procs):
         _terminate_proc(p)
     extra_procs = []
+    
+    # 2) 终止主检索进程
+    _terminate_proc(proc)
 
     # 3) 清理临时目录
     for d in list(temp_dirs):
