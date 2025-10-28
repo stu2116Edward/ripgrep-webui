@@ -391,7 +391,10 @@ socket.on('progress', data => {
     // 只在单文件检索时更新匹配数，多文件检索时由sendKeyword函数控制
     if (typeof data.matches === 'number' && document.getElementById('file').value !== '__ALL__') {
         matches = data.matches;
-        document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
+        // 避免在进度条更新过程中频繁更新匹配数显示
+        if (!running || (Date.now() - lastProgressAt) >= PROGRESS_THROTTLE_MS) {
+            document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
+        }
     }
     if (typeof data.files_total === 'number') files_total = data.files_total;
     if (typeof data.files_done === 'number') files_done = data.files_done;
