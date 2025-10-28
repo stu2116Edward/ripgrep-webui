@@ -2025,6 +2025,9 @@ def search():
                 # 搜索阶段计时（毫秒级）
                 search_start_ns = {}
                 last_progress_tick_ns = 0
+                # 添加匹配数更新节流机制
+                last_match_progress_ns = 0
+                MATCH_PROGRESS_THROTTLE_NS = 200_000_000  # 200ms节流
 
                 # 发送初始匹配数和总文件数（files_total）
                 try:
@@ -2163,6 +2166,11 @@ def search():
                         block_ready = False
                         # 文件结束：更新完成数并推送进度
                         files_done += 1
+                        # 文件结束时强制发送一次进度更新，确保匹配数同步
+                        try:
+                            elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
+                        except Exception:
+                            elapsed_ms_total = 0
                         socketio.emit('progress', {
                             'matches': match_count,
                             'files_total': total_files,
@@ -2201,11 +2209,15 @@ def search():
                             buf.append(out_block)
                             emit_message_utf(out_block + '\n')
                             match_count += 1
-                            try:
-                                elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
-                            except Exception:
-                                elapsed_ms_total = 0
-                            emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
+                            # 节流匹配数进度更新
+                            now_ns = time.perf_counter_ns()
+                            if now_ns - last_match_progress_ns >= MATCH_PROGRESS_THROTTLE_NS:
+                                try:
+                                    elapsed_ms_total = int((now_ns - request_start_ns) / 1_000_000)
+                                except Exception:
+                                    elapsed_ms_total = 0
+                                emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
+                                last_match_progress_ns = now_ns
                             first_block = False
                         else:
                             # 纯空白块：把换行发给前端但不计为匹配
@@ -2236,11 +2248,15 @@ def search():
                         buf.append(out_block)
                         emit_message_utf(out_block + '\n')
                         match_count += 1
-                        try:
-                            elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
-                        except Exception:
-                            elapsed_ms_total = 0
-                        emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
+                        # 节流匹配数进度更新
+                        now_ns = time.perf_counter_ns()
+                        if now_ns - last_match_progress_ns >= MATCH_PROGRESS_THROTTLE_NS:
+                            try:
+                                elapsed_ms_total = int((now_ns - request_start_ns) / 1_000_000)
+                            except Exception:
+                                elapsed_ms_total = 0
+                            emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
+                            last_match_progress_ns = now_ns
                     else:
                         socketio.emit('message', {'message': '\n'})
         except Exception:
