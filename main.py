@@ -23,6 +23,9 @@ temp_dirs = []
 output_buffers = {}  # 关键字 -> 行内容列表
 cancel_requested = False
 
+# 后台导出文件的流式写入句柄（按安全化后的关键字区分）
+export_streams = {}
+
 # 扩展的进度事件发射器（支持毫秒计时与字节进度）
 def emit_progress_ex(phase=None, file_type=None, elapsed_ms=None,
                      bytes_done=None, bytes_total=None,
@@ -69,6 +72,76 @@ def emit_message_utf(text):
                 text = ''
         sanitized = text.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
         socketio.emit('message', {'message': sanitized})
+    except Exception:
+        pass
+
+# 关键字安全化（用于文件名前缀）
+def _sanitize_keyword(keyword: str) -> str:
+    try:
+        safe = ''.join(c for c in (keyword or '') if c.isalnum() or c in (' ', '_', '-')).strip()
+        return safe or 'search'
+    except Exception:
+        return 'search'
+
+# 启动一个新的导出文件写入流（每次搜索唯一文件）
+def start_export_stream(safe_kw: str):
+    import datetime
+    try:
+        exports_dir = os.path.join(os.path.dirname(__file__), 'exports')
+        os.makedirs(exports_dir, exist_ok=True)
+        today = datetime.datetime.now().strftime('%Y-%m-%d')
+        ts = int(time.time())
+        filename = f"{safe_kw}_{today}_{ts}.txt"
+        filepath = os.path.join(exports_dir, filename)
+        fh = open(filepath, 'w', encoding='utf-8')
+        export_streams[safe_kw] = {'fh': fh, 'path': filepath}
+        return filepath
+    except Exception:
+        return None
+
+# 追加写入文本到导出文件（若未初始化则尝试创建）
+def append_export_text(safe_kw: str, text: str):
+    try:
+        info = export_streams.get(safe_kw)
+        if not info or not info.get('fh'):
+            start_export_stream(safe_kw)
+            info = export_streams.get(safe_kw)
+        fh = info and info.get('fh')
+        if not fh:
+            return
+        # 确保是字符串并以 UTF-8 写入
+        if not isinstance(text, str):
+            try:
+                text = str(text)
+            except Exception:
+                text = ''
+        sanitized = text.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+        fh.write(sanitized)
+    except Exception:
+        pass
+
+# 关闭指定关键字的导出流
+def close_export_stream(safe_kw: str):
+    try:
+        info = export_streams.pop(safe_kw, None)
+        if info and info.get('fh'):
+            try:
+                info['fh'].flush()
+            except Exception:
+                pass
+            try:
+                info['fh'].close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+# 关闭所有导出流（用于取消或搜索结束清理）
+def close_all_export_streams():
+    try:
+        for safe_kw in list(export_streams.keys()):
+            close_export_stream(safe_kw)
+        export_streams.clear()
     except Exception:
         pass
 
@@ -739,6 +812,24 @@ def search():
     # 预先计算 total_files（尽量精确）
     total_files = 0
     try:
+        # 队列：用于所有 rg 进程的 stdout 行实时转发
+        q = queue.Queue()
+
+        # 前向器：读取某个 rg 进程的 stdout 并写入队列，避免 stdout 堵塞
+        def forward_proc_stdout(p):
+            pid = getattr(p, 'pid', id(p))
+            try:
+                if p.stdout is None:
+                    return
+                for raw in p.stdout:
+                    if cancel_requested:
+                        break
+                    q.put((raw, pid))
+            except Exception:
+                pass
+            finally:
+                # 标识该进程的 EOF
+                q.put((None, pid))
         # Helper: 启动 rg 并加入监听列表
         def start_rg_for_path(path, stdin_pipe=None, label=None, exclude_patterns=None, python_stream_feed=None):
             """
@@ -783,8 +874,20 @@ def search():
                         _proc_label_map[pid] = label
                 except Exception:
                     pass
+            # 立即启动该 rg 的 stdout 前向线程，避免在长时间 stdin 写入时发生阻塞
+            try:
+                t = threading.Thread(target=forward_proc_stdout, args=(rg_proc,), daemon=True)
+                t.start()
+            except Exception:
+                pass
 
             all_rg_procs.append(rg_proc)
+            # 注册到清理列表，确保取消时一并终止
+            try:
+                extra_procs_local.append(rg_proc)
+                extra_procs.append(rg_proc)
+            except Exception:
+                pass
             return rg_proc
 
         # If user specified a single existing file -> handle as before but with python fallbacks
@@ -985,8 +1088,18 @@ def search():
                                         preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None,
                                         creationflags=popen_creationflags()
                                     )
+                                    # 立即启动 stdout 前向线程，避免阻塞
+                                    try:
+                                        t = threading.Thread(target=forward_proc_stdout, args=(rg_proc,), daemon=True)
+                                        t.start()
+                                    except Exception:
+                                        pass
                                     extra_procs_local.append(rg_proc)
                                     all_rg_procs.append(rg_proc)
+                                    try:
+                                        extra_procs.append(rg_proc)
+                                    except Exception:
+                                        pass
                                     if not supports_label:
                                         try:
                                             _proc_label_map[rg_proc.pid] = label
@@ -1046,8 +1159,18 @@ def search():
                                         shell=False,
                                         preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
                                     )
+                                    # 立即启动 stdout 前向线程，保持实时输出
+                                    try:
+                                        t = threading.Thread(target=forward_proc_stdout, args=(rg_proc,), daemon=True)
+                                        t.start()
+                                    except Exception:
+                                        pass
                                     extra_procs_local.append(rg_proc)
                                     all_rg_procs.append(rg_proc)
+                                    try:
+                                        extra_procs.append(rg_proc)
+                                    except Exception:
+                                        pass
                                     if not supports_label:
                                         try:
                                             _proc_label_map[rg_proc.pid] = label
@@ -1104,8 +1227,18 @@ def search():
                                             shell=False,
                                             preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
                                         )
+                                        # 立即启动 stdout 前向线程
+                                        try:
+                                            t = threading.Thread(target=forward_proc_stdout, args=(rg_proc,), daemon=True)
+                                            t.start()
+                                        except Exception:
+                                            pass
                                         extra_procs_local.append(rg_proc)
                                         all_rg_procs.append(rg_proc)
+                                        try:
+                                            extra_procs.append(rg_proc)
+                                        except Exception:
+                                            pass
                                         if not supports_label:
                                             try:
                                                 _proc_label_map[rg_proc.pid] = label
@@ -1177,8 +1310,18 @@ def search():
                                             shell=False,
                                             preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
                                         )
+                                        # 启动 stdout 前向线程
+                                        try:
+                                            t = threading.Thread(target=forward_proc_stdout, args=(rg_proc,), daemon=True)
+                                            t.start()
+                                        except Exception:
+                                            pass
                                         extra_procs_local.append(rg_proc)
                                         all_rg_procs.append(rg_proc)
+                                        try:
+                                            extra_procs.append(rg_proc)
+                                        except Exception:
+                                            pass
                                         if not supports_label:
                                             try:
                                                 _proc_label_map[rg_proc.pid] = label
@@ -1251,8 +1394,18 @@ def search():
                                                 shell=False,
                                                 preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
                                             )
+                                            # 启动 stdout 前向线程
+                                            try:
+                                                t = threading.Thread(target=forward_proc_stdout, args=(rg_proc,), daemon=True)
+                                                t.start()
+                                            except Exception:
+                                                pass
                                             extra_procs_local.append(rg_proc)
                                             all_rg_procs.append(rg_proc)
+                                            try:
+                                                extra_procs.append(rg_proc)
+                                            except Exception:
+                                                pass
                                             if not supports_label:
                                                 try:
                                                     _proc_label_map[rg_proc.pid] = label
@@ -1956,30 +2109,8 @@ def search():
             socketio.emit('message', {'message': '?? No searchable files or rg failed to start\n'})
             return "No search procs"
 
-        # 统一监听这些 rg 进程的 stdout：使用队列 + 每个进程独立线程转发 stdout -> 队列
-        q = queue.Queue()
+        # 统一监听这些 rg 进程的 stdout：队列已在前文创建，并在每次 rg 启动时开启前向线程
         total_procs = len(all_rg_procs)
-
-        def forward_stdout(p):
-            pid = getattr(p, 'pid', id(p))
-            try:
-                if p.stdout is None:
-                    return
-                for raw in p.stdout:
-                    if cancel_requested:
-                        break
-                    q.put((raw, pid))
-            except Exception:
-                pass
-            finally:
-                # 标识该进程的 EOF
-                q.put((None, pid))
-
-        for p in all_rg_procs:
-            t = threading.Thread(target=forward_stdout, args=(p,), daemon=True)
-            t.start()
-            extra_procs_local.append(p)
-            extra_procs.append(p)
 
         # 将第一个 rg 进程作为主引用（用于 cancel 等），但后台会管理所有进程
         proc = all_rg_procs[0]
@@ -2009,6 +2140,9 @@ def search():
         global proc, extra_procs, temp_dirs, _proc_label_map
         buf = []
         output_buffers[keyword] = buf
+        # 初始化后台导出写入流（按安全化关键字命名唯一文件）
+        safe_kw = _sanitize_keyword(keyword)
+        start_export_stream(safe_kw)
         # match_count 现在按实际输出的“内容区块”计数，保证与页面显示一致
         match_count = 0
         files_done = 0
@@ -2139,18 +2273,20 @@ def search():
                             for i in range(context_after_n):
                                 block.append(after_lines[i] if i < len(after_lines) else '')
                             out_block = '\n'.join(block)
-                            if out_block.strip():
-                                if not first_block:
-                                    buf.append('')
-                                    socketio.emit('message', {'message': '\n'})
+                        if out_block.strip():
+                            if not first_block:
+                                # 分块间写入空行以便分隔
+                                append_export_text(safe_kw, '\n')
+                                socketio.emit('message', {'message': '\n'})
 
-                                buf.append(out_block)
-                                emit_message_utf(out_block + '\n')
-                                match_count += 1
-                                try:
-                                    elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
-                                except Exception:
-                                    elapsed_ms_total = 0
+                            # 直接流式写盘并推送到前端
+                            append_export_text(safe_kw, out_block + '\n')
+                            emit_message_utf(out_block + '\n')
+                            match_count += 1
+                            try:
+                                elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
+                            except Exception:
+                                elapsed_ms_total = 0
                                 emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
                                 first_block = False
                             else:
@@ -2196,9 +2332,9 @@ def search():
                         # 只有非空区块计为匹配并输出
                         if out_block.strip():
                             if not first_block:
-                                buf.append('')
+                                append_export_text(safe_kw, '\n')
                                 socketio.emit('message', {'message': '\n'})
-                            buf.append(out_block)
+                            append_export_text(safe_kw, out_block + '\n')
                             emit_message_utf(out_block + '\n')
                             match_count += 1
                             try:
@@ -2228,12 +2364,12 @@ def search():
                     out_block = '\n'.join(block)
                     if out_block.strip():
                         if not first_block:
-                            buf.append('')
+                            append_export_text(safe_kw, '\n')
                             socketio.emit('message', {'message': '\n'})
                         label = _proc_label_map.get(owner)
                         if label:
                             out_block = f"[{label}]\n" + out_block
-                        buf.append(out_block)
+                        append_export_text(safe_kw, out_block + '\n')
                         emit_message_utf(out_block + '\n')
                         match_count += 1
                         try:
@@ -2257,7 +2393,7 @@ def search():
                                 label = _proc_label_map.get(getattr(p, 'pid', None))
                                 if label:
                                     text = f"[{label}] {text}"
-                                buf.append(text)
+                                append_export_text(safe_kw, text)
                                 socketio.emit('message', {'message': text})
                 except Exception:
                     pass
@@ -2321,13 +2457,8 @@ def search():
             except Exception:
                 elapsed_ms_total = 0
             emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
-
-            # 尝试保存导出
-            try:
-                save_export(keyword, buf)
-            except Exception as e:
-                with app.app_context():
-                    socketio.emit('message', {'message': f'?? Save failed: {e}\n'})
+            # 已采用流式写盘，关闭导出流
+            close_export_stream(safe_kw)
 
             # 确保所有进程都已完成，特别是对于7z等大文件处理
             try:
@@ -2462,17 +2593,8 @@ def cancel():
             pass
     temp_dirs = []
 
-    # 4) 保存并清空输出缓冲，避免内存泄漏
-    try:
-        for kw, buf in list(output_buffers.items()):
-            if buf:
-                try:
-                    save_export(kw, buf)
-                except Exception:
-                    pass
-        output_buffers.clear()
-    except Exception:
-        pass
+    # 4) 关闭并清空导出流，避免资源泄漏（已流式写盘）
+    close_all_export_streams()
 
     # 5) 状态复位
     proc = None
