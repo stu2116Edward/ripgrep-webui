@@ -25,7 +25,7 @@ COPY main.py .
 COPY templates/ ./templates/
 
 # 设置环境变量
-ENV GUNICORN_CMD_ARGS="-w 1 -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker"
+ENV GUNICORN_CMD_ARGS="-w 1 -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker --timeout 0 --graceful-timeout 0 --keep-alive 75"
 ENV PYTHONUNBUFFERED="TRUE"
 
 # 验证 ripgrep 安装
