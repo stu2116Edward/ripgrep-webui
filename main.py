@@ -20,8 +20,11 @@ extra_procs = []
 # 临时目录列表（例如对 archive 的解包目录），结束时需要清理
 temp_dirs = []
 
-output_buffers = {}  # 关键字 -> 行内容列表
+# 取消标志（替代原先缓冲与一次性落盘逻辑）
 cancel_requested = False
+
+# 后台导出文件的流式写入句柄（按安全化后的关键字区分）
+export_streams = {}
 
 # 扩展的进度事件发射器（支持毫秒计时与字节进度）
 def emit_progress_ex(phase=None, file_type=None, elapsed_ms=None,
@@ -40,7 +43,7 @@ def emit_progress_ex(phase=None, file_type=None, elapsed_ms=None,
             payload['phase'] = str(phase)
         if file_type:
             payload['file_type'] = str(file_type)
-        # elapsed_ms disabled: stop sending time to frontend
+        # elapsed_ms 已禁用：停止向前端发送时间
         if bytes_done is not None:
             try:
                 bd = int(bytes_done)
@@ -69,6 +72,95 @@ def emit_message_utf(text):
                 text = ''
         sanitized = text.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
         socketio.emit('message', {'message': sanitized})
+    except Exception:
+        pass
+
+# 关键字安全化（用于文件名前缀）
+def _sanitize_keyword(keyword: str) -> str:
+    try:
+        safe = ''.join(c for c in (keyword or '') if c.isalnum() or c in (' ', '_', '-')).strip()
+        return safe or 'search'
+    except Exception:
+        return 'search'
+
+# 统一导出目录选择：固定为 /app/exports（Docker 容器卷），不再使用本地路径或环境变量
+def get_exports_dir():
+    try:
+        os.makedirs('/app/exports', exist_ok=True)
+    except Exception:
+        # 在 Docker 中通常已通过挂载创建；忽略创建失败
+        pass
+    return '/app/exports'
+
+# 启动一个新的导出文件写入流（每次搜索唯一文件）
+def start_export_stream(safe_kw: str):
+    import datetime
+    try:
+        # 统一导出目录选择（容器环境）
+        exports_dir = get_exports_dir()
+        os.makedirs(exports_dir, exist_ok=True)
+        today = datetime.datetime.now().strftime('%Y-%m-%d')
+        ts = int(time.time())
+        filename = f"{safe_kw}_{today}_{ts}.txt"
+        filepath = os.path.join(exports_dir, filename)
+        fh = open(filepath, 'w', encoding='utf-8')
+        export_streams[safe_kw] = {'fh': fh, 'path': filepath}
+        return filepath
+    except Exception:
+        return None
+
+# 追加写入文本到导出文件（若未初始化则尝试创建）
+def append_export_text(safe_kw: str, text: str):
+    try:
+        info = export_streams.get(safe_kw)
+        if not info or not info.get('fh'):
+            start_export_stream(safe_kw)
+            info = export_streams.get(safe_kw)
+        fh = info and info.get('fh')
+        if not fh:
+            return
+        # 确保是字符串并以 UTF-8 写入
+        if not isinstance(text, str):
+            try:
+                text = str(text)
+            except Exception:
+                text = ''
+        sanitized = text.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+        fh.write(sanitized)
+        # 实时落盘：立即刷新并尝试 fsync，确保写入不因缓冲而延迟
+        try:
+            fh.flush()
+        except Exception:
+            pass
+        try:
+            os.fsync(fh.fileno())
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+# 关闭指定关键字的导出流
+def close_export_stream(safe_kw: str):
+    try:
+        info = export_streams.pop(safe_kw, None)
+        if info and info.get('fh'):
+            try:
+                info['fh'].flush()
+            except Exception:
+                pass
+            try:
+                info['fh'].close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+# 关闭所有导出流（用于取消或搜索结束清理）
+def close_all_export_streams():
+    try:
+        for safe_kw in list(export_streams.keys()):
+            close_export_stream(safe_kw)
+        export_streams.clear()
     except Exception:
         pass
 
@@ -169,7 +261,7 @@ def check_rg_supports_label():
 
 
 def try_py7zr_extract(archive_path, dest):
-    """Try to extract 7z (and many other formats) using py7zr if available."""
+    """如果可行，尝试使用 py7zr 解压 7z（以及许多其他格式）"""
     try:
         import py7zr
     except Exception:
@@ -183,7 +275,7 @@ def try_py7zr_extract(archive_path, dest):
 
 
 def try_rarfile_extract(archive_path, dest):
-    """Try to extract rar using rarfile python lib if available."""
+    """如果可用，尝试使用 Python 的 rarfile 库来解压 rar 文件"""
     try:
         import rarfile
     except Exception:
@@ -387,7 +479,7 @@ def stream_excel_to_writer(path, out_stream):
             try:
                 import openpyxl
             except Exception:
-                socketio.emit('message', {'message': f'?? openpyxl not installed, cannot parse xlsx: {os.path.basename(path)}\n'})
+                socketio.emit('message', {'message': f'openpyxl not installed, cannot parse xlsx: {os.path.basename(path)}\n'})
                 return
             # 以只读模式打开，data_only=True 获取公式计算值（若存在）
             wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
@@ -426,7 +518,7 @@ def stream_excel_to_writer(path, out_stream):
             try:
                 import xlrd
             except Exception:
-                socketio.emit('message', {'message': f'?? xlrd not installed, cannot parse xls: {os.path.basename(path)}\n'})
+                socketio.emit('message', {'message': f'xlrd not installed, cannot parse xls: {os.path.basename(path)}\n'})
                 return
             wb = xlrd.open_workbook(path, on_demand=True)
             for si in range(wb.nsheets):
@@ -454,10 +546,10 @@ def stream_excel_to_writer(path, out_stream):
                 pass
         else:
             # 非支持格式
-            socketio.emit('message', {'message': f'?? Unsupported excel format: {path}\n'})
+            socketio.emit('message', {'message': f'Unsupported excel format: {path}\n'})
             return
     except Exception as e:
-        socketio.emit('message', {'message': f'?? Excel parse failed for {os.path.basename(path)}: {e}\n'})
+        socketio.emit('message', {'message': f'Excel parse failed for {os.path.basename(path)}: {e}\n'})
         return
 
 # 允许传入内存字节的 Excel 转换（供归档成员或解压输出使用）
@@ -515,7 +607,7 @@ def stream_excel_bytes_to_writer(name_lower, data_bytes, out_stream):
             except Exception:
                 pass
     except Exception as e:
-        socketio.emit('message', {'message': f'?? Excel parse failed (bytes) for {name_lower}: {e}\n'})
+        socketio.emit('message', {'message': f'Excel parse failed (bytes) for {name_lower}: {e}\n'})
         return
 
 # CSV 文件对象直接复制到输出（提供统一接口）
@@ -667,12 +759,12 @@ def index():
 @app.route('/search', methods=['POST'])
 def search():
     global proc, extra_procs, temp_dirs, _proc_label_map, cancel_requested
-    # Only proceed if no search is currently running
+    # 只有在没有搜索正在进行时才继续
     if proc is not None:
-        socketio.emit('message', {'message': '?????? Busy ??????\n'})
+        socketio.emit('message', {'message': 'Busy\n'})
         return "Busy"
     
-    # Reset cancel flag when starting a fresh search
+    # 在开始新搜索时重置取消标志
     cancel_requested = False
 
     data = request.json or {}
@@ -682,6 +774,14 @@ def search():
     context_before = int(data.get('context_before', 0) or 0)
     context_after = int(data.get('context_after', 0) or 0)
     file = (data.get('file') or '').strip()
+
+    # 在提交后立即创建导出文件，确保检索过程中可实时写入，避免内存峰值
+    try:
+        safe_kw_init = _sanitize_keyword(keyword)
+        start_export_stream(safe_kw_init)
+    except Exception:
+        # 保持流程继续；append_export_text 会在需要时兜底创建
+        pass
 
     # 基本 rg 参数
     rg_base = ['rg', '-uuu', '--smart-case', '--json']
@@ -739,6 +839,24 @@ def search():
     # 预先计算 total_files（尽量精确）
     total_files = 0
     try:
+        # 队列：用于所有 rg 进程的 stdout 行实时转发
+        q = queue.Queue()
+
+        # 前向器：读取某个 rg 进程的 stdout 并写入队列，避免 stdout 堵塞
+        def forward_proc_stdout(p):
+            pid = getattr(p, 'pid', id(p))
+            try:
+                if p.stdout is None:
+                    return
+                for raw in p.stdout:
+                    if cancel_requested:
+                        break
+                    q.put((raw, pid))
+            except Exception:
+                pass
+            finally:
+                # 标识该进程的 EOF
+                q.put((None, pid))
         # Helper: 启动 rg 并加入监听列表
         def start_rg_for_path(path, stdin_pipe=None, label=None, exclude_patterns=None, python_stream_feed=None):
             """
@@ -783,15 +901,27 @@ def search():
                         _proc_label_map[pid] = label
                 except Exception:
                     pass
+            # 立即启动该 rg 的 stdout 前向线程，避免在长时间 stdin 写入时发生阻塞
+            try:
+                t = threading.Thread(target=forward_proc_stdout, args=(rg_proc,), daemon=True)
+                t.start()
+            except Exception:
+                pass
 
             all_rg_procs.append(rg_proc)
+            # 注册到清理列表，确保取消时一并终止
+            try:
+                extra_procs_local.append(rg_proc)
+                extra_procs.append(rg_proc)
+            except Exception:
+                pass
             return rg_proc
 
-        # If user specified a single existing file -> handle as before but with python fallbacks
+        # 如果用户指定了一个已存在的单个文件 -> 与以前一样处理，但使用 Python 回退
         if file and os.path.isfile(search_path):
             file_lower = file.lower()
 
-            # === 支持 Excel 文件（xls/xlsx）直接流式检索 ===
+            # 支持 Excel 文件（xls/xlsx）直接流式检索
             if is_excel_file(file_lower):
                 total_files = 1
                 safe_label = os.path.basename(file)
@@ -803,10 +933,10 @@ def search():
                 try:
                     start_rg_for_path('-', label=safe_label, python_stream_feed=feed_fn)
                 except Exception as e:
-                    socketio.emit('message', {'message': f'?? Failed to start rg for excel: {e}\n'})
+                    socketio.emit('message', {'message': f'Failed to start rg for excel: {e}\n'})
                     return "Excel stream failed"
 
-            # === 处理单文件压缩：解压并按内部类型转换后流式喂入 rg ===
+            # 处理单文件压缩：解压并按内部类型转换后流式喂入 rg
             elif is_single_file_compressed(file_lower):
                 try:
                     rel_label = os.path.basename(file)
@@ -879,10 +1009,10 @@ def search():
                                 python_decompress_feed(p, e, w)
                             start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
                 except Exception as e:
-                    socketio.emit('message', {'message': f'?? Single-compressed stream failed: {e}\n'})
+                    socketio.emit('message', {'message': f'Single-compressed stream failed: {e}\n'})
                     return "Single-compressed stream failed"
 
-            # === 直接流式处理 tar 系列归档（gz/bz2/xz/无压缩） ===
+            # 直接流式处理 tar 系列归档（gz/bz2/xz/无压缩）
             elif file_lower.endswith(('.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz', '.tar')):
                 # 直接流式处理 tar 归档内容，无需落盘；为每个归档内文件启动一个 rg（stdin）
                 try:
@@ -951,10 +1081,10 @@ def search():
                         total_files = 1
                         start_rg_for_path(search_path)
                 except Exception as e:
-                    socketio.emit('message', {'message': f'?? Tar stream failed: {e}\n'})
+                    socketio.emit('message', {'message': f'Tar stream failed: {e}\n'})
                     return "Tar stream failed"
 
-            # 直接流式处理 zip/rar/7z 等归档（无外部 extractor 情况下的回退） ===
+            # 直接流式处理 zip/rar/7z 等归档（无外部 extractor 情况下的回退）
             elif is_archive_multi_file(file_lower):
                 # 优先尝试 python 库的“逐文件流式读取并喂入 rg”方式，避免依赖外部 extractor
                 streamed = False
@@ -985,8 +1115,18 @@ def search():
                                         preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None,
                                         creationflags=popen_creationflags()
                                     )
+                                    # 立即启动 stdout 前向线程，避免阻塞
+                                    try:
+                                        t = threading.Thread(target=forward_proc_stdout, args=(rg_proc,), daemon=True)
+                                        t.start()
+                                    except Exception:
+                                        pass
                                     extra_procs_local.append(rg_proc)
                                     all_rg_procs.append(rg_proc)
+                                    try:
+                                        extra_procs.append(rg_proc)
+                                    except Exception:
+                                        pass
                                     if not supports_label:
                                         try:
                                             _proc_label_map[rg_proc.pid] = label
@@ -1012,6 +1152,11 @@ def search():
                                             pass
                                     try:
                                         rg_proc.stdin.close()
+                                    except Exception:
+                                        pass
+                                    # 串行化：等待当前成员的检索完成后再继续下一个
+                                    try:
+                                        rg_proc.wait()
                                     except Exception:
                                         pass
                                 except Exception:
@@ -1046,8 +1191,18 @@ def search():
                                         shell=False,
                                         preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
                                     )
+                                    # 立即启动 stdout 前向线程，保持实时输出
+                                    try:
+                                        t = threading.Thread(target=forward_proc_stdout, args=(rg_proc,), daemon=True)
+                                        t.start()
+                                    except Exception:
+                                        pass
                                     extra_procs_local.append(rg_proc)
                                     all_rg_procs.append(rg_proc)
+                                    try:
+                                        extra_procs.append(rg_proc)
+                                    except Exception:
+                                        pass
                                     if not supports_label:
                                         try:
                                             _proc_label_map[rg_proc.pid] = label
@@ -1073,6 +1228,11 @@ def search():
                                             pass
                                     try:
                                         rg_proc.stdin.close()
+                                    except Exception:
+                                        pass
+                                    # 串行化等待当前成员的检索结束
+                                    try:
+                                        rg_proc.wait()
                                     except Exception:
                                         pass
                                 except Exception:
@@ -1104,8 +1264,18 @@ def search():
                                             shell=False,
                                             preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
                                         )
+                                        # 立即启动 stdout 前向线程
+                                        try:
+                                            t = threading.Thread(target=forward_proc_stdout, args=(rg_proc,), daemon=True)
+                                            t.start()
+                                        except Exception:
+                                            pass
                                         extra_procs_local.append(rg_proc)
                                         all_rg_procs.append(rg_proc)
+                                        try:
+                                            extra_procs.append(rg_proc)
+                                        except Exception:
+                                            pass
                                         if not supports_label:
                                             try:
                                                 _proc_label_map[rg_proc.pid] = label
@@ -1148,6 +1318,11 @@ def search():
                                             dec_proc.wait()
                                         except Exception:
                                             pass
+                                        # 串行化：等待 rg 完成当前成员的检索
+                                        try:
+                                            rg_proc.wait()
+                                        except Exception:
+                                            pass
                                     except Exception:
                                         continue
                                 streamed_local = True
@@ -1177,8 +1352,18 @@ def search():
                                             shell=False,
                                             preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
                                         )
+                                        # 启动 stdout 前向线程
+                                        try:
+                                            t = threading.Thread(target=forward_proc_stdout, args=(rg_proc,), daemon=True)
+                                            t.start()
+                                        except Exception:
+                                            pass
                                         extra_procs_local.append(rg_proc)
                                         all_rg_procs.append(rg_proc)
+                                        try:
+                                            extra_procs.append(rg_proc)
+                                        except Exception:
+                                            pass
                                         if not supports_label:
                                             try:
                                                 _proc_label_map[rg_proc.pid] = label
@@ -1220,6 +1405,11 @@ def search():
                                             dec_proc.wait()
                                         except Exception:
                                             pass
+                                        # 串行化：等待 rg 完成本成员检索
+                                        try:
+                                            rg_proc.wait()
+                                        except Exception:
+                                            pass
                                     except Exception:
                                         continue
                                 streamed_local = True
@@ -1251,8 +1441,18 @@ def search():
                                                 shell=False,
                                                 preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None
                                             )
+                                            # 启动 stdout 前向线程
+                                            try:
+                                                t = threading.Thread(target=forward_proc_stdout, args=(rg_proc,), daemon=True)
+                                                t.start()
+                                            except Exception:
+                                                pass
                                             extra_procs_local.append(rg_proc)
                                             all_rg_procs.append(rg_proc)
+                                            try:
+                                                extra_procs.append(rg_proc)
+                                            except Exception:
+                                                pass
                                             if not supports_label:
                                                 try:
                                                     _proc_label_map[rg_proc.pid] = label
@@ -1286,6 +1486,11 @@ def search():
                                                 pass
                                             try:
                                                 rg_proc.stdin.close()
+                                            except Exception:
+                                                pass
+                                            # 串行化：等待 rg 完成本成员检索
+                                            try:
+                                                rg_proc.wait()
                                             except Exception:
                                                 pass
                                         except Exception:
@@ -1350,7 +1555,7 @@ def search():
                             out, err = extract_proc.communicate()
                             if extract_proc.returncode != 0:
                                 msg = err.decode('utf-8', errors='replace') if err else 'Unknown extraction error'
-                                socketio.emit('message', {'message': f'?? Extraction failed: {msg}\n'})
+                                socketio.emit('message', {'message': f'Extraction failed: {msg}\n'})
                                 try:
                                     shutil.rmtree(temp_dir_for_archive)
                                 except Exception:
@@ -1358,7 +1563,7 @@ def search():
                                 temp_dirs.remove(temp_dir_for_archive)
                                 return "Extraction failed"
                         except FileNotFoundError:
-                            socketio.emit('message', {'message': f'?? Missing extractor on system for archive: {file}\n'})
+                            socketio.emit('message', {'message': f'Missing extractor on system for archive: {file}\n'})
                             try:
                                 shutil.rmtree(temp_dir_for_archive)
                             except Exception:
@@ -1380,7 +1585,12 @@ def search():
                     total_files = (non_excel_count + len(excel_files_list)) if (non_excel_count + len(excel_files_list)) > 0 else 1
                     # 目录扫描时排除 Excel，避免重复
                     exclude_patterns = [f'**/*{ext}' for ext in EXCEL_EXTS]
-                    start_rg_for_path(temp_dir_for_archive, exclude_patterns=exclude_patterns)
+                    # 串行化：目录扫描结束前不并行其他任务
+                    _p_dir = start_rg_for_path(temp_dir_for_archive, exclude_patterns=exclude_patterns)
+                    try:
+                        _p_dir.wait()
+                    except Exception:
+                        pass
                     # 对每个 Excel 文件做流式转换并交给 rg
                     for full in excel_files_list:
                         # label 使用 归档名/归档内相对路径
@@ -1389,12 +1599,16 @@ def search():
                         def feed_fn(w, p=full):
                             stream_excel_to_writer(p, w)
                         try:
-                            start_rg_for_path('-', label=label, python_stream_feed=feed_fn)
+                            _p_excel = start_rg_for_path('-', label=label, python_stream_feed=feed_fn)
+                            try:
+                                _p_excel.wait()
+                            except Exception:
+                                pass
                         except Exception:
                             continue
 
             else:
-                # single normal file: count as 1
+                # 单个普通文件：计为1
                 total_files = 1
                 # 对于非压缩/归档/Excel 的单文件，使用 stdin 流式喂入并按字节上报进度
                 try:
@@ -1421,16 +1635,24 @@ def search():
                                 copy_fileobj_chunked(f, w, progress_cb=_cb, bytes_total=size_c)
                         except Exception:
                             pass
-                    start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                    _p_single = start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                    try:
+                        _p_single.wait()
+                    except Exception:
+                        pass
                 else:
-                    start_rg_for_path(search_path)
+                    _p_path = start_rg_for_path(search_path)
+                    try:
+                        _p_path.wait()
+                    except Exception:
+                        pass
         else:
-            # Directory search (default) -> include compressed, archives and excel
-            non_excluded_count = 0
+            # 目录搜索（默认）-> 包括压缩文件、归档和 Excel
+            regular_files = []
             compressed_files = []
             archive_files = []
             excel_files = []
-            # gather files first so we can count precisely
+            # 先收集文件，这样我们才能准确计算
             for root, _, fns in os.walk(search_path):
                 for fn in fns:
                     # 若启用了仅文件名过滤，则只统计匹配的文件
@@ -1445,9 +1667,9 @@ def search():
                     elif is_excel_file(fn_lower):
                         excel_files.append(full)
                     else:
-                        non_excluded_count += 1
-            total_files = non_excluded_count + len(compressed_files) + len(excel_files)
-            # For archives, try streaming with python libs first; if streaming succeeds, it will start rg per member.
+                        regular_files.append(full)
+            total_files = len(regular_files) + len(compressed_files) + len(excel_files)
+            # 对于存档，首先尝试使用 Python 库进行流式处理；如果流式处理成功，它将针对每个成员启动 rg
             for full_archive in archive_files:
                 streamed = False
                 try:
@@ -1500,6 +1722,11 @@ def search():
                                                     pass
                                             try:
                                                 rg_proc.stdin.close()
+                                            except Exception:
+                                                pass
+                                            # 串行化：等待 rg 完成本成员检索
+                                            try:
+                                                rg_proc.wait()
                                             except Exception:
                                                 pass
                                             total_files += 1
@@ -1559,6 +1786,11 @@ def search():
                                             pass
                                     try:
                                         rg_proc.stdin.close()
+                                    except Exception:
+                                        pass
+                                    # 串行化：等待当前成员检索完成
+                                    try:
+                                        rg_proc.wait()
                                     except Exception:
                                         pass
                                     total_files += 1
@@ -1628,6 +1860,11 @@ def search():
                                             pass
                                         try:
                                             dec_proc.wait()
+                                        except Exception:
+                                            pass
+                                        # 串行化：等待 rg 完成当前成员检索
+                                        try:
+                                            rg_proc.wait()
                                         except Exception:
                                             pass
                                     except Exception:
@@ -1700,6 +1937,11 @@ def search():
                                             dec_proc.wait()
                                         except Exception:
                                             pass
+                                        # 串行化：等待 rg 完成本成员检索
+                                        try:
+                                            rg_proc.wait()
+                                        except Exception:
+                                            pass
                                     except Exception:
                                         continue
                                 streamed_local = True
@@ -1736,7 +1978,7 @@ def search():
                                             all_rg_procs.append(rg_proc)
                                             if not supports_label:
                                                 _proc_label_map[rg_proc.pid] = label
-                                            # Read single member data
+                                            # 读取单个成员数据
                                             try:
                                                 dm = z.read([name])
                                                 obj = dm.get(name)
@@ -1852,17 +2094,45 @@ def search():
                         for _ in fns:
                             cnt += 1
                     total_files += cnt if cnt > 0 else 1
-                    start_rg_for_path(temp_dir_for_archive)
+                    _p_arch_dir = start_rg_for_path(temp_dir_for_archive)
+                    try:
+                        _p_arch_dir.wait()
+                    except Exception:
+                        pass
                 except Exception:
                     continue
 
-            # start main rg for non-compressed files, excluding compressed/archives/excel to avoid duplicates
-            exclude_patterns = []
-            for ext in SINGLE_COMPRESSED_EXTS + ARCHIVE_EXTS + EXCEL_EXTS:
-                exclude_patterns.append(f'**/*{ext}')
-            start_rg_for_path(search_path, exclude_patterns=exclude_patterns)
+            # 为非压缩文件启动主搜索，不包括压缩文件/归档文件/Excel 文件以避免重复
+            # 串行逐文件检索常规文件，确保完整枚举与稳定落盘
+            for full in regular_files:
+                fn = os.path.basename(full)
+                fn_lower = fn.lower()
+                rel_label = os.path.relpath(full, data_dir)
+                def feed_fn(w, p=full, lb=rel_label, fl=fn_lower):
+                    size_c = None
+                    try:
+                        size_c = os.path.getsize(p)
+                    except Exception:
+                        size_c = None
+                    ft = classify_file_type(fl)
+                    def _cb(done, total, elapsed_ms, ft_local=ft, lb_local=lb):
+                        emit_progress_ex(
+                            phase='scan', file_type=ft_local,
+                            elapsed_ms=elapsed_ms, bytes_done=done, bytes_total=total,
+                            label=lb_local
+                        )
+                    try:
+                        with open(p, 'rb') as f:
+                            copy_fileobj_chunked(f, w, progress_cb=_cb, bytes_total=size_c)
+                    except Exception:
+                        pass
+                _p_reg = start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                try:
+                    _p_reg.wait()
+                except Exception:
+                    pass
 
-            # start rg for each compressed file (streamed). Prefer external tool; if missing, use python stream feed
+            # 为每个压缩文件（流式）启动 rg。优先使用外部工具；如果缺失，则使用 Python 流式输入
             for full in compressed_files:
                 fn = os.path.basename(full)
                 fn_lower = fn.lower()
@@ -1890,7 +2160,11 @@ def search():
                                     )
                                 # 目录扫描下的单压缩 Excel：直接流到临时文件再转换
                                 spool_stream_to_temp_then_stream_excel(name, proc.stdout, w)
-                            start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                            _p_cf = start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                            try:
+                                _p_cf.wait()
+                            except Exception:
+                                pass
                         else:
                             def feed_fn(w, proc=decompressor_proc, lb=rel_label, orig=full):
                                 size_c = None
@@ -1905,7 +2179,11 @@ def search():
                                         label=lb
                                     )
                                 copy_fileobj_chunked(proc.stdout, w, progress_cb=_cb, bytes_total=size_c)
-                            start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                            _p_cf2 = start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                            try:
+                                _p_cf2.wait()
+                            except Exception:
+                                pass
                     except FileNotFoundError:
                         inner_lower = strip_single_compress_ext(fn_lower)
                         if is_excel_file(inner_lower):
@@ -1914,11 +2192,19 @@ def search():
                                 python_decompress_feed(p, e, bio)
                                 data = bio.getvalue()
                                 stream_excel_bytes_to_writer(inner, data, w)
-                            start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                            _p_py1 = start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                            try:
+                                _p_py1.wait()
+                            except Exception:
+                                pass
                         else:
                             def feed_fn(w, p=full, e=fn_lower):
                                 python_decompress_feed(p, e, w)
-                            start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                            _p_py2 = start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                            try:
+                                _p_py2.wait()
+                            except Exception:
+                                pass
                 else:
                     inner_lower = strip_single_compress_ext(fn_lower)
                     if is_excel_file(inner_lower):
@@ -1947,45 +2233,27 @@ def search():
                 def feed_fn(w, p=full):
                     stream_excel_to_writer(p, w)
                 try:
-                    start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                    _p_excel2 = start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+                    try:
+                        _p_excel2.wait()
+                    except Exception:
+                        pass
                 except Exception:
                     continue
 
-        # If no rg started, error
+        # 如果没有启动 RG，出错
         if not all_rg_procs:
-            socketio.emit('message', {'message': '?? No searchable files or rg failed to start\n'})
+            socketio.emit('message', {'message': 'No searchable files or rg failed to start\n'})
             return "No search procs"
 
-        # 统一监听这些 rg 进程的 stdout：使用队列 + 每个进程独立线程转发 stdout -> 队列
-        q = queue.Queue()
+        # 统一监听这些 rg 进程的 stdout：队列已在前文创建，并在每次 rg 启动时开启前向线程
         total_procs = len(all_rg_procs)
-
-        def forward_stdout(p):
-            pid = getattr(p, 'pid', id(p))
-            try:
-                if p.stdout is None:
-                    return
-                for raw in p.stdout:
-                    if cancel_requested:
-                        break
-                    q.put((raw, pid))
-            except Exception:
-                pass
-            finally:
-                # 标识该进程的 EOF
-                q.put((None, pid))
-
-        for p in all_rg_procs:
-            t = threading.Thread(target=forward_stdout, args=(p,), daemon=True)
-            t.start()
-            extra_procs_local.append(p)
-            extra_procs.append(p)
 
         # 将第一个 rg 进程作为主引用（用于 cancel 等），但后台会管理所有进程
         proc = all_rg_procs[0]
 
     except Exception as e:
-        socketio.emit('message', {'message': f'?? Start failed: {e}\n'})
+        socketio.emit('message', {'message': f'Start failed: {e}\n'})
         for p in extra_procs_local:
             try:
                 os.killpg(os.getpgid(p.pid), signal.SIGTERM)
@@ -2007,8 +2275,8 @@ def search():
     request_start_ns = time.perf_counter_ns()
     def get_output_loop():
         global proc, extra_procs, temp_dirs, _proc_label_map
-        buf = []
-        output_buffers[keyword] = buf
+        # 使用关键字生成导出流标识；导出文件已在提交阶段创建
+        safe_kw = _sanitize_keyword(keyword)
         # match_count 现在按实际输出的“内容区块”计数，保证与页面显示一致
         match_count = 0
         files_done = 0
@@ -2021,13 +2289,13 @@ def search():
                 after_lines = []
                 block_main = None
                 block_ready = False
+                after_emit_count = 0
                 first_block = True
                 # 搜索阶段计时（毫秒级）
                 search_start_ns = {}
                 last_progress_tick_ns = 0
-                # 添加匹配数更新节流机制
-                last_match_progress_ns = 0
-                MATCH_PROGRESS_THROTTLE_NS = 200_000_000  # 200ms节流
+                # 记录每个进程当前文件的可读标签（路径或显式 label），便于进度与写盘头信息
+                owner_current_label = {}
 
                 # 发送初始匹配数和总文件数（files_total）
                 try:
@@ -2044,7 +2312,7 @@ def search():
                     try:
                         raw_item, owner = q.get(timeout=0.05)  # Reduced timeout for more frequent cancel checks
                     except queue.Empty:
-                        # Check for cancellation more frequently
+                        # 更频繁地检查取消情况
                         if cancel_requested:
                             break
                         # 检查进程是否全部退出并且队列空 => 结束
@@ -2087,9 +2355,9 @@ def search():
                         continue
 
                     typ = obj.get('type')
-                    # handle 'begin' to update files_done
+                    # 处理 'begin' 以更新 files_done
                     if typ == 'begin':
-                        # Check for cancellation before processing
+                        # 在处理之前检查是否已取消
                         if cancel_requested:
                             break
                         # 如果 rg 不支持 --label，则尝试注入 label 到 obj 的 path 字段（仅本地使用）
@@ -2103,6 +2371,17 @@ def search():
                             search_start_ns[owner] = time.perf_counter_ns()
                         except Exception:
                             pass
+                        # 写入文件头到导出（无论是否会命中），保证实时落盘记录
+                        try:
+                            data_path = (obj.get('data') or {}).get('path') or {}
+                            label_text = data_path.get('text') if isinstance(data_path, dict) else None
+                        except Exception:
+                            label_text = None
+                        if not label_text:
+                            label_text = _proc_label_map.get(owner)
+                        if label_text:
+                            owner_current_label[owner] = label_text
+                            append_export_text(safe_kw, f"[{label_text}]\n")
                         # 本次文件开始时不增加 files_done，保持以文件结束为准
                         # 重置本文件缓冲
                         before_lines = []
@@ -2110,45 +2389,22 @@ def search():
                         block_main = None
                         block_ready = False
                     elif typ == 'context':
-                        # Check for cancellation before processing
+                        # 在处理之前检查是否已取消
                         if cancel_requested:
                             break
                         data = obj.get('data', {})
-                        line_text = data.get('lines', {}).get('text', '')
-                        line_text = (line_text or '').strip()
-                        if block_main is None:
+                        line_text = (data.get('lines', {}).get('text', '') or '').strip()
+                        if not block_ready:
                             before_lines.append(line_text)
                             if len(before_lines) > context_before_n:
                                 before_lines.pop(0)
                         else:
-                            after_lines.append(line_text)
-                    elif typ == 'match':
-                        # Check for cancellation before processing
-                        if cancel_requested:
-                            break
-                        data = obj.get('data', {})
-                        line_text = data.get('lines', {}).get('text', '')
-                        line_text = (line_text or '').strip()
-                        block_main = line_text
-                        after_lines = []
-                        block_ready = True
-                    elif typ == 'end':
-                        # Flush any pending block with padded empty lines at file boundary
-                        if block_ready:
-                            block = []
-                            for i in range(context_before_n):
-                                block.append(before_lines[i] if i < len(before_lines) else '')
-                            block.append(block_main if block_main else '')
-                            for i in range(context_after_n):
-                                block.append(after_lines[i] if i < len(after_lines) else '')
-                            out_block = '\n'.join(block)
-                            if out_block.strip():
-                                if not first_block:
-                                    buf.append('')
-                                    socketio.emit('message', {'message': '\n'})
-
-                                buf.append(out_block)
-                                emit_message_utf(out_block + '\n')
+                            # 实时输出后文行
+                            append_export_text(safe_kw, line_text + '\n')
+                            emit_message_utf(line_text + '\n')
+                            after_emit_count += 1
+                            # 若后文满足要求，完成该块
+                            if after_emit_count >= context_after_n:
                                 match_count += 1
                                 try:
                                     elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
@@ -2156,21 +2412,77 @@ def search():
                                     elapsed_ms_total = 0
                                 emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
                                 first_block = False
-                            else:
-                                socketio.emit('message', {'message': '\n'})
+                                block_ready = False
+                                # 将主行加入前文缓冲，供后续块使用
+                                before_lines.append(block_main)
+                                if len(before_lines) > context_before_n:
+                                    before_lines.pop(0)
+                                block_main = None
+                                after_emit_count = 0
+                                after_lines = []
+                    elif typ == 'match':
+                        # 在处理之前检查是否已取消
+                        if cancel_requested:
+                            break
+                        data = obj.get('data', {})
+                        line_text = (data.get('lines', {}).get('text', '') or '').strip()
+
+                        # 若上一块仍未结束，立即补齐后文并完成它
+                        if block_ready:
+                            while after_emit_count < context_after_n:
+                                append_export_text(safe_kw, '\n')
+                                emit_message_utf('\n')
+                                after_emit_count += 1
+                            match_count += 1
+                            try:
+                                elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
+                            except Exception:
+                                elapsed_ms_total = 0
+                            emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
+                            first_block = False
                             block_ready = False
-                        # reset buffers at end of file
+
+                        # 开始新块：分隔空行、输出前文与主行并实时写盘
+                        if not first_block:
+                            append_export_text(safe_kw, '\n')
+                            emit_message_utf('\n')
+                        for i in range(context_before_n):
+                            t = before_lines[i] if i < len(before_lines) else ''
+                            append_export_text(safe_kw, t + '\n')
+                            emit_message_utf(t + '\n')
+                        append_export_text(safe_kw, line_text + '\n')
+                        emit_message_utf(line_text + '\n')
+
+                        # 标记进入后文阶段
+                        block_main = line_text
+                        after_emit_count = 0
+                        after_lines = []
+                        block_ready = True
+                    elif typ == 'end':
+                        # 文件边界：若当前块仍未完成，补齐后文空行并完成该块
+                        if block_ready:
+                            while after_emit_count < context_after_n:
+                                append_export_text(safe_kw, '\n')
+                                emit_message_utf('\n')
+                                after_emit_count += 1
+                            match_count += 1
+                            try:
+                                elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
+                            except Exception:
+                                elapsed_ms_total = 0
+                            emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
+                            first_block = False
+                            block_ready = False
+                            block_main = None
+                            after_emit_count = 0
+                            after_lines = []
+                        # 在文件末尾重置缓冲区
                         before_lines = []
                         after_lines = []
                         block_main = None
                         block_ready = False
                         # 文件结束：更新完成数并推送进度
                         files_done += 1
-                        # 文件结束时强制发送一次进度更新，确保匹配数同步
-                        try:
-                            elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
-                        except Exception:
-                            elapsed_ms_total = 0
                         socketio.emit('progress', {
                             'matches': match_count,
                             'files_total': total_files,
@@ -2181,8 +2493,8 @@ def search():
                             ns = search_start_ns.pop(owner, None)
                             if ns is not None:
                                 elapsed_ms = int((time.perf_counter_ns() - ns) / 1_000_000)
-                                # 推测文件类型：优先使用 pid->label，再基于后缀分类
-                                label = _proc_label_map.get(owner)
+                                # 推测文件类型：优先使用当前标签（路径），再基于后缀分类
+                                label = owner_current_label.get(owner) or _proc_label_map.get(owner)
                                 ft = classify_file_type(label.lower()) if label else None
                                 emit_progress_ex(
                                     phase='search_end', file_type=ft,
@@ -2192,73 +2504,7 @@ def search():
                         except Exception:
                             pass
 
-                    # 输出区块（每次命中后，等下文收集够了再输出）
-                    if block_ready and (len(after_lines) >= context_after_n):
-                        block = []
-                        for i in range(context_before_n):
-                            block.append(before_lines[i] if i < len(before_lines) else '')
-                        block.append(block_main if block_main else '')
-                        for i in range(context_after_n):
-                            block.append(after_lines[i] if i < len(after_lines) else '')
-                        out_block = '\n'.join(block)
-                        # 只有非空区块计为匹配并输出
-                        if out_block.strip():
-                            if not first_block:
-                                buf.append('')
-                                socketio.emit('message', {'message': '\n'})
-                            buf.append(out_block)
-                            emit_message_utf(out_block + '\n')
-                            match_count += 1
-                            # 节流匹配数进度更新
-                            now_ns = time.perf_counter_ns()
-                            if now_ns - last_match_progress_ns >= MATCH_PROGRESS_THROTTLE_NS:
-                                try:
-                                    elapsed_ms_total = int((now_ns - request_start_ns) / 1_000_000)
-                                except Exception:
-                                    elapsed_ms_total = 0
-                                emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
-                                last_match_progress_ns = now_ns
-                            first_block = False
-                        else:
-                            # 纯空白块：把换行发给前端但不计为匹配
-                            socketio.emit('message', {'message': '\n'})
-                        block_ready = False
-                        before_lines.append(block_main)
-                        if len(before_lines) > context_before_n:
-                            before_lines.pop(0)
-                        block_main = None
-                        after_lines = []
-
-                # 处理最后一个可能未满足下文要求的区块（仍要输出）
-                if block_ready:
-                    block = []
-                    for i in range(context_before_n):
-                        block.append(before_lines[i] if i < len(before_lines) else '')
-                    block.append(block_main if block_main else '')
-                    for i in range(context_after_n):
-                        block.append(after_lines[i] if i < len(after_lines) else '')
-                    out_block = '\n'.join(block)
-                    if out_block.strip():
-                        if not first_block:
-                            buf.append('')
-                            socketio.emit('message', {'message': '\n'})
-                        label = _proc_label_map.get(owner)
-                        if label:
-                            out_block = f"[{label}]\n" + out_block
-                        buf.append(out_block)
-                        emit_message_utf(out_block + '\n')
-                        match_count += 1
-                        # 节流匹配数进度更新
-                        now_ns = time.perf_counter_ns()
-                        if now_ns - last_match_progress_ns >= MATCH_PROGRESS_THROTTLE_NS:
-                            try:
-                                elapsed_ms_total = int((now_ns - request_start_ns) / 1_000_000)
-                            except Exception:
-                                elapsed_ms_total = 0
-                            emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
-                            last_match_progress_ns = now_ns
-                    else:
-                        socketio.emit('message', {'message': '\n'})
+                    # 逐行流式写盘：已在 match/context/end 分支实时输出并更新进度
         except Exception:
             # 兜底：管道可能已断，尝试将剩余 stdout 简单转发
             with app.app_context():
@@ -2273,8 +2519,8 @@ def search():
                                 label = _proc_label_map.get(getattr(p, 'pid', None))
                                 if label:
                                     text = f"[{label}] {text}"
-                                buf.append(text)
-                                socketio.emit('message', {'message': text})
+                                append_export_text(safe_kw, text)
+                                emit_message_utf(text)
                 except Exception:
                     pass
         finally:
@@ -2337,13 +2583,8 @@ def search():
             except Exception:
                 elapsed_ms_total = 0
             emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
-
-            # 尝试保存导出
-            try:
-                save_export(keyword, buf)
-            except Exception as e:
-                with app.app_context():
-                    socketio.emit('message', {'message': f'?? Save failed: {e}\n'})
+            # 已采用流式写盘，关闭导出流
+            close_export_stream(safe_kw)
 
             # 确保所有进程都已完成，特别是对于7z等大文件处理
             try:
@@ -2360,13 +2601,13 @@ def search():
 
             with app.app_context():
                 if not cancel_requested:
-                    socketio.emit('message', {'message': '?????? Done ??????\n'})
+                    emit_message_utf('Done\n')
 
     # 启动后台读写线程
     thread = threading.Thread(target=get_output_loop, daemon=True)
     thread.start()
     # 立即通知前端搜索启动（前端会显示进度条）并发送初始 total_files
-    emit_message_utf('?????? Started ??????\n')
+    emit_message_utf('Started\n')
     try:
         elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
     except Exception:
@@ -2377,12 +2618,12 @@ def search():
 
 @app.route('/cancel', methods=['POST'])
 def cancel():
-    global proc, extra_procs, temp_dirs, output_buffers, _proc_label_map, cancel_requested
+    global proc, extra_procs, temp_dirs, _proc_label_map, cancel_requested
     request_cancel_ns = time.perf_counter_ns()
     cancel_requested = True
     
-    # Immediately emit cancel message to notify frontend
-    emit_message_utf('??? Cancelled ???\n')
+    # 立即发送取消消息以通知前端
+    emit_message_utf('Cancelled\n')
     emit_progress_ex(phase='cancelled')
 
     # 安全关闭流的辅助函数
@@ -2417,7 +2658,7 @@ def cancel():
             if hasattr(p, 'poll') and p.poll() is None:
                 if os.name != 'nt':
                     try:
-                        # Try to kill the process group first
+                        # 请先尝试终止进程组
                         pgid = os.getpgid(p.pid)
                         os.killpg(pgid, signal.SIGTERM)
                     except Exception:
@@ -2432,13 +2673,13 @@ def cancel():
                     except Exception:
                         pass
                 
-                # Wait a bit for graceful termination
+                # 稍等片刻以优雅终止
                 try:
                     p.wait(timeout=0.5)
                 except Exception:
                     pass
                 
-                # If still running, force kill
+                # 如果仍在运行，强制结束
                 if hasattr(p, 'poll') and p.poll() is None:
                     if os.name == 'nt':
                         try:
@@ -2448,7 +2689,7 @@ def cancel():
                             pass
                     else:
                         try:
-                            # Try process group kill first, then individual process
+                            # 先尝试终止进程组，然后再终止单个进程
                             try:
                                 pgid = os.getpgid(p.pid)
                                 os.killpg(pgid, signal.SIGKILL)
@@ -2478,52 +2719,21 @@ def cancel():
             pass
     temp_dirs = []
 
-    # 4) 保存并清空输出缓冲，避免内存泄漏
-    try:
-        for kw, buf in list(output_buffers.items()):
-            if buf:
-                try:
-                    save_export(kw, buf)
-                except Exception:
-                    pass
-        output_buffers.clear()
-    except Exception:
-        pass
+    # 4) 关闭并清空导出流，避免资源泄漏（已流式写盘）
+    close_all_export_streams()
 
     # 5) 状态复位
     proc = None
     _proc_label_map = {}
 
     # 6) 通知前端取消
-    emit_message_utf('??? Cancelled ???\n')
+    emit_message_utf('Cancelled\n')
     try:
         elapsed_ms_total = int((time.perf_counter_ns() - request_cancel_ns) / 1_000_000)
     except Exception:
         elapsed_ms_total = 0
     emit_progress_ex(phase='cancelled', elapsed_ms=elapsed_ms_total)
     return jsonify({"status": "cancelled"}), 200
-
-
-def save_export(keyword, buf_lines):
-    import datetime
-    safe = ''.join(c for c in keyword if c.isalnum() or c in (' ', '_', '-')).strip()
-    if not safe:
-        safe = 'search'
-    exports_dir = os.path.join(os.path.dirname(__file__), 'exports')
-    os.makedirs(exports_dir, exist_ok=True)
-    today = datetime.datetime.now().strftime('%Y-%m-%d')
-    filename = f"{safe}_{today}.txt"
-    filepath = os.path.join(exports_dir, filename)
-    if os.path.exists(filepath):
-        ts = int(time.time())
-        filename = f"{safe}_{today}_{ts}.txt"
-        filepath = os.path.join(exports_dir, filename)
-    content = '\n'.join(line.rstrip('\n') for line in buf_lines if line.strip() or line == '')
-    if not content.endswith('\n'):
-        content = content + '\n'
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(content)
-    return filepath
 
 
 @app.route('/download')
@@ -2534,7 +2744,8 @@ def download():
     safe = ''.join(c for c in keyword if c.isalnum() or c in (' ', '_', '-')).strip()
     if not safe:
         safe = 'search'
-    exports_dir = os.path.join(os.path.dirname(__file__), 'exports')
+    # 与写入路径保持一致：自适应导出目录
+    exports_dir = get_exports_dir()
     candidates = []
     if os.path.isdir(exports_dir):
         for fn in os.listdir(exports_dir):
