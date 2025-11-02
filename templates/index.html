@@ -322,7 +322,7 @@ socket.on('message', data => {
     if (!data || typeof data.message !== 'string') return;
     const text = data.message.replace(/\r?\n/g, '\n');
 
-    if (text.includes('??? Cancelled ???')) {
+    if (text.includes('Cancelled')) {
         if (pendingSubmit) return;
         running = false;
         pendingSubmit = false;
@@ -391,10 +391,7 @@ socket.on('progress', data => {
     // 只在单文件检索时更新匹配数，多文件检索时由sendKeyword函数控制
     if (typeof data.matches === 'number' && document.getElementById('file').value !== '__ALL__') {
         matches = data.matches;
-        // 避免在进度条更新过程中频繁更新匹配数显示
-        if (!running || (Date.now() - lastProgressAt) >= PROGRESS_THROTTLE_MS) {
-            document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
-        }
+        document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
     }
     if (typeof data.files_total === 'number') files_total = data.files_total;
     if (typeof data.files_done === 'number') files_done = data.files_done;
@@ -604,7 +601,7 @@ function clearResult() {
 function exportResult() {
     const content = document.getElementById('result').textContent
                       .split('\n')
-                      .filter(line => !line.includes('??? Cancelled ???'))
+                      .filter(line => !line.includes('Cancelled'))
                       .join('\n');
     if (!content.trim()) { alert('检索结果为空，无需导出！'); return; }
     const kw = document.getElementById('keyword').value.trim().replace(/[^\w\u4e00-\u9fa5\-_ ]/g, '');
