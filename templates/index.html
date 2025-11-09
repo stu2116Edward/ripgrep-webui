@@ -158,6 +158,34 @@
 <script>
 var socket = io({path: '/io'});
 
+// 缓存常用 DOM 引用，减少重复查询
+const resultEl = document.getElementById('result');
+
+// 结果文本缓冲：批量 prepend，减少频繁的 DOM 触发
+let resultBuffer = '';
+let flushScheduled = false;
+function enqueueResult(text) {
+    // 始终以字符串形式累计
+    const t = (typeof text === 'string') ? text : String(text || '');
+    resultBuffer += t;
+    scheduleFlush();
+}
+function scheduleFlush() {
+    if (flushScheduled) return;
+    flushScheduled = true;
+    // 使用 rAF 在下一帧统一写入，提高渲染效率
+    (window.requestAnimationFrame || setTimeout)(flushResultNow, 16);
+}
+function flushResultNow() {
+    try {
+        if (resultBuffer && resultBuffer.length > 0) {
+            resultEl.textContent = resultBuffer + resultEl.textContent;
+            resultBuffer = '';
+        }
+    } catch (e) {}
+    flushScheduled = false;
+}
+
 let running = false;
 let pendingSubmit = false;
 let lastSubmitAt = 0;
@@ -322,7 +350,7 @@ socket.on('message', data => {
     if (!data || typeof data.message !== 'string') return;
     const text = data.message.replace(/\r?\n/g, '\n');
 
-    if (text.includes('??? Cancelled ???')) {
+    if (text.includes('Cancelled')) {
         if (pendingSubmit) return;
         running = false;
         pendingSubmit = false;
@@ -377,10 +405,10 @@ socket.on('message', data => {
     if (/^\s*\?\?/.test(text)) return;
 
     if (text.trim().length > 0) {
-        document.getElementById('result').textContent = text + document.getElementById('result').textContent;
+        enqueueResult(text);
         receivedChunks++;
     } else {
-        document.getElementById('result').textContent = text + document.getElementById('result').textContent;
+        enqueueResult(text);
     }
 });
 
@@ -601,7 +629,7 @@ function clearResult() {
 function exportResult() {
     const content = document.getElementById('result').textContent
                       .split('\n')
-                      .filter(line => !line.includes('??? Cancelled ???'))
+                      .filter(line => !line.includes('Cancelled'))
                       .join('\n');
     if (!content.trim()) { alert('检索结果为空，无需导出！'); return; }
     const kw = document.getElementById('keyword').value.trim().replace(/[^\w\u4e00-\u9fa5\-_ ]/g, '');
