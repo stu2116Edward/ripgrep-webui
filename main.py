@@ -121,15 +121,6 @@ def start_export_stream(safe_kw: str):
                             item = ''
                     sanitized = item.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
                     fh.write(sanitized)
-                    try:
-                        fh.flush()
-                        # 强制刷盘，确保 Windows 上文件大小实时更新
-                        try:
-                            os.fsync(fh.fileno())
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
             except Exception:
                 pass
         t = threading.Thread(target=_writer_loop, daemon=True)
