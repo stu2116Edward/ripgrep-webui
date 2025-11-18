@@ -96,6 +96,8 @@
 
             <!-- 专属一行显示匹配数（居中、独占一行） -->
             <div id="matchDisplay" class="text-center">匹配：0 条</div>
+            <!-- 连接状态显示：放在匹配数下方 -->
+            <div id="connectStatus" class="text-center text-muted small">连接中...</div>
 
             <form class="mb-2 px-2 py-3 bg-white rounded shadow-sm">
                 <div class="row g-2 align-items-center">
@@ -156,7 +158,56 @@
     </div>
 </div>
 <script>
-var socket = io({path: '/io'});
+var socket = io({
+    path: '/io',
+    // 强制使用 WebSocket，避免某些环境下长轮询升级失败导致断连
+    transports: ['websocket'],
+    // 更稳健的重连与超时设置
+    reconnection: true,
+    reconnectionAttempts: 10,
+    timeout: 20000
+});
+
+// 连接状态更新函数
+function setConnectionStatus(text) {
+    const el = document.getElementById('connectStatus');
+    if (el) el.textContent = text || '';
+}
+
+// 监听连接相关事件，更新状态文本
+socket.on('connect', () => setConnectionStatus('已连接'));
+socket.on('disconnect', () => setConnectionStatus('未连接'));
+socket.on('connect_error', () => setConnectionStatus('连接异常'));
+socket.on('reconnect_attempt', () => setConnectionStatus('重连中...'));
+socket.on('reconnect', () => setConnectionStatus('已连接'));
+
+// 缓存常用 DOM 引用，减少重复查询
+const resultEl = document.getElementById('result');
+
+// 结果文本缓冲：批量 append，减少频繁的 DOM 触发
+let resultBuffer = '';
+let flushScheduled = false;
+function enqueueResult(text) {
+    // 始终以字符串形式累计
+    const t = (typeof text === 'string') ? text : String(text || '');
+    resultBuffer += t;
+    scheduleFlush();
+}
+function scheduleFlush() {
+    if (flushScheduled) return;
+    flushScheduled = true;
+    // 使用 rAF 在下一帧统一写入，提高渲染效率
+    (window.requestAnimationFrame || setTimeout)(flushResultNow, 16);
+}
+function flushResultNow() {
+    try {
+        if (resultBuffer && resultBuffer.length > 0) {
+            resultEl.textContent = resultEl.textContent + resultBuffer;
+            resultBuffer = '';
+        }
+    } catch (e) {}
+    flushScheduled = false;
+}
 
 let running = false;
 let pendingSubmit = false;
@@ -321,6 +372,11 @@ window.addEventListener('DOMContentLoaded', function(){
 socket.on('message', data => {
     if (!data || typeof data.message !== 'string') return;
     const text = data.message.replace(/\r?\n/g, '\n');
+    const trimmed = text.trim();
+
+    // 拦截后端推送的连接状态文案，改为在状态区显示
+    if (trimmed === 'Connected') { setConnectionStatus('已连接'); return; }
+    if (trimmed === 'Disconnected') { setConnectionStatus('未连接'); return; }
 
     if (text.includes('Cancelled')) {
         if (pendingSubmit) return;
@@ -377,10 +433,10 @@ socket.on('message', data => {
     if (/^\s*\?\?/.test(text)) return;
 
     if (text.trim().length > 0) {
-        document.getElementById('result').textContent = text + document.getElementById('result').textContent;
+        enqueueResult(text);
         receivedChunks++;
     } else {
-        document.getElementById('result').textContent = text + document.getElementById('result').textContent;
+        enqueueResult(text);
     }
 });
 
