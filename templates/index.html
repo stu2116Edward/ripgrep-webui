@@ -19,6 +19,15 @@
             max-height: calc(70vh);
             min-height: 200px;
             box-shadow: inset 0 0 0 1px rgba(0,0,0,0.04);
+            /* 防止悬停控件时触发整页重绘导致卡顿 */
+            contain: layout paint;
+            will-change: transform;
+            transform: translateZ(0);
+            overscroll-behavior: contain;
+            scrollbar-gutter: stable;
+            /* 仅渲染可见内容，离屏内容延迟绘制，降低大文本影响 */
+            content-visibility: auto;
+            contain-intrinsic-size: 200px;
         }
         @media (max-width: 768px) {
             #result { max-height: calc(60vh); min-height: 150px; }
@@ -33,6 +42,10 @@
             box-shadow: 0 6px 18px rgba(0,0,0,0.04);
             display: none; /* hidden by default */
             align-items: center;
+            /* 独立绘制，避免与大文本区互相影响 */
+            contain: paint;
+            will-change: transform;
+            transform: translateZ(0);
         }
         .progress-info {
             display:flex;
@@ -54,8 +67,15 @@
             border-radius: 999px;
         }
         /* Smooth progress bar animation */
-        #progressBar { transition: width 220ms ease-in-out; }
+        #progressBar { transition: width 220ms ease-in-out; will-change: width; }
         .no-transition { transition: none !important; }
+        /* 进度容器独立绘制，避免与大文本互相影响 */
+        .progress { contain: paint; }
+
+        /* 遵循系统减少动画偏好 */
+        @media (prefers-reduced-motion: reduce) {
+            #progressBar { transition: none !important; }
+        }
 
         /* match display under title */
         #matchDisplay {
@@ -86,6 +106,33 @@
             text-overflow: ellipsis;
             max-width: 70%;
         }
+
+        /* 控件区独立合成层 + 取消按钮过渡，减少悬停重绘成本 */
+        #controls {
+            contain: paint;
+            will-change: transform;
+            transform: translateZ(0);
+        }
+        #controls .btn {
+            transition: none !important;
+            backface-visibility: hidden;
+        }
+        /* 输入框与下拉菜单：禁用过渡与阴影，降低悬停/聚焦重绘 */
+        #controls .form-control,
+        #controls select.form-control {
+            transition: none !important;
+            box-shadow: none !important;
+            backface-visibility: hidden;
+        }
+        /* 轻量可访问焦点样式：避免 box-shadow 带来的重绘开销 */
+        #controls .form-control:focus {
+            box-shadow: none !important;
+            border-color: #80bdff;
+            outline: 2px solid rgba(128, 189, 255, 0.7);
+            outline-offset: 0;
+        }
+        /* 输入区块行：独立绘制以避免影响大文本区域 */
+        #controls .row { contain: paint; }
     </style>
 </head>
 <body>
@@ -99,7 +146,7 @@
             <!-- 连接状态显示：放在匹配数下方 -->
             <div id="connectStatus" class="text-center text-muted small">连接中...</div>
 
-            <form class="mb-2 px-2 py-3 bg-white rounded shadow-sm">
+            <form id="controls" class="mb-2 px-2 py-3 bg-white rounded shadow-sm">
                 <div class="row g-2 align-items-center">
                     <div class="col-12 col-md-5 mb-2 mb-md-0">
                         <input type="text" id="keyword" class="form-control" placeholder="输入关键词" style="font-size:1.1em;">
@@ -183,6 +230,11 @@ socket.on('reconnect', () => setConnectionStatus('已连接'));
 
 // 缓存常用 DOM 引用，减少重复查询
 const resultEl = document.getElementById('result');
+// 使用单一 Text 节点减少对已有大文本的复制，降低卡顿
+let resultTextNode = null;
+const MAX_RESULT_CHARS = 2000000; // 保留最近 ~2MB 文本，防止内存无限增长
+const TRIM_AT_CHARS = 2500000;    // 超过阈值再裁剪，减少频繁复制
+const FLUSH_CHUNK_SIZE = 65536;   // 以 64KB 分块追加，避免一次性大字符串阻塞
 
 // 结果文本缓冲：批量 append，减少频繁的 DOM 触发
 let resultBuffer = '';
@@ -202,11 +254,49 @@ function scheduleFlush() {
 function flushResultNow() {
     try {
         if (resultBuffer && resultBuffer.length > 0) {
-            resultEl.textContent = resultEl.textContent + resultBuffer;
+            if (resultTextNode && typeof resultTextNode.appendData === 'function') {
+                // 分块写入，降低长字符串追加带来的阻塞
+                let start = 0;
+                const len = resultBuffer.length;
+                while (start < len) {
+                    const end = Math.min(start + FLUSH_CHUNK_SIZE, len);
+                    resultTextNode.appendData(resultBuffer.slice(start, end));
+                    start = end;
+                }
+                // 超过阈值时只保留最后 MAX_RESULT_CHARS 的内容
+                if (resultTextNode.data && resultTextNode.data.length > TRIM_AT_CHARS) {
+                    resultTextNode.data = resultTextNode.data.slice(-MAX_RESULT_CHARS);
+                }
+            } else {
+                // 兜底：如果 Text 节点不可用，退回 textContent 方式
+                resultEl.textContent = resultEl.textContent + resultBuffer;
+                if (resultEl.textContent.length > TRIM_AT_CHARS) {
+                    resultEl.textContent = resultEl.textContent.slice(-MAX_RESULT_CHARS);
+                }
+            }
             resultBuffer = '';
         }
     } catch (e) {}
     flushScheduled = false;
+}
+
+// 在搜索完成或取消后触发一次主动压缩，避免长字符串残留占用内存
+function compactResultIfLarge() {
+    try {
+        const res = document.getElementById('result');
+        if (!res) return;
+        // 先确保缓冲区已写入
+        try { flushResultNow(); } catch (e) {}
+        const current = (resultTextNode && resultTextNode.data) ? resultTextNode.data : (res.textContent || '');
+        if (current && current.length > MAX_RESULT_CHARS) {
+            const tail = current.slice(-MAX_RESULT_CHARS);
+            // 替换为新的 Text 节点，有助于释放旧字符串的内存占用
+            const t = document.createTextNode(tail);
+            res.textContent = '';
+            try { res.appendChild(t); } catch (e) {}
+            resultTextNode = t;
+        }
+    } catch (e) {}
 }
 
 let running = false;
@@ -280,12 +370,20 @@ function setProgressState(state, opts = {}) {
         let pct = typeof opts.pct === 'number' ? opts.pct : 0;
         pct = Math.max(0, Math.min(100, pct));
         bar.classList.remove('no-transition');
-        bar.style.width = pct + '%';
-        bar.className = 'progress-bar progress-bar-striped progress-bar-animated bg-info';
+        // 仅在最小变化达到 1% 时更新，降低重绘频率
+        const lastPct = parseFloat(bar.dataset.lastPct || '0');
+        if (Math.abs(pct - lastPct) >= 1) {
+            bar.style.width = pct + '%';
+            bar.dataset.lastPct = String(pct);
+        }
+        // 移除条纹动画，使用静态色块以降低绘制成本
+        bar.className = 'progress-bar bg-info';
         badge.className = 'badge badge-info progress-status-badge';
         badge.textContent = opts.text || '检索中';
         matchEl.textContent = `匹配：${matches} 条`;
-        percent.textContent = pct + '%';
+        if (Math.abs(pct - lastPct) >= 1) {
+            percent.textContent = pct + '%';
+        }
         if (opts.file) {
             currentFileName = opts.file;
             fileNameEl.textContent = `正在检索：${opts.file}`;
@@ -349,6 +447,19 @@ function disableControls(val) {
 }
 
 window.addEventListener('DOMContentLoaded', function(){
+    // 初始化结果区域为单一 Text 节点，降低后续写入的重排/复制成本
+    try {
+        resultEl.textContent = '';
+        resultTextNode = document.createTextNode('');
+        resultEl.appendChild(resultTextNode);
+    } catch (e) {}
+
+    // 触发容器内进程热重载：每次页面打开或刷新时调用
+    try {
+        setConnectionStatus('后台重载中...');
+        trackedFetch('/hot-reload', { method: 'POST' }, true).catch(() => {});
+    } catch (e) {}
+
     trackedFetch('/files', {}, true)
     .then(r => r.ok ? r.json() : Promise.reject())
     .then(list => {
@@ -388,6 +499,8 @@ socket.on('message', data => {
         document.getElementById('submitBtn').disabled = false;
         clearTimeout(progressHideTimeout);
         progressHideTimeout = setTimeout(() => hideProgress(), 1200);
+        // 取消后主动压缩一次结果，保证后续内存稳定
+        compactResultIfLarge();
         return;
     }
 
@@ -427,6 +540,8 @@ socket.on('message', data => {
         document.getElementById('submitBtn').disabled = false;
         clearTimeout(progressHideTimeout);
         progressHideTimeout = setTimeout(() => hideProgress(), 1200);
+        // 完成后主动压缩一次结果，保证后续内存稳定
+        compactResultIfLarge();
         return;
     }
 
@@ -441,7 +556,7 @@ socket.on('message', data => {
 });
 
 let lastProgressAt = 0;
-const PROGRESS_THROTTLE_MS = 120;
+const PROGRESS_THROTTLE_MS = 180;
 
 socket.on('progress', data => {
     // 只在单文件检索时更新匹配数，多文件检索时由sendKeyword函数控制
@@ -495,6 +610,8 @@ socket.on('progress', data => {
         document.getElementById('submitBtn').disabled = false;
         clearTimeout(progressHideTimeout);
         progressHideTimeout = setTimeout(() => hideProgress(), 1200);
+        // 进度判断到达完成时也压缩一次结果，消除顺序差异的占用
+        compactResultIfLarge();
         return;
     }
     const now = Date.now();
@@ -645,8 +762,25 @@ function cancelSearch() {
 
 function clearResult() {
     try {
+        // 重置缓冲与计划的刷新，避免残留数据影响下一次渲染
+        try { resultBuffer = ''; } catch (e) {}
+        try { flushScheduled = false; } catch (e) {}
+
+        // 重新创建结果区域的 Text 节点，避免清空后旧节点被移除导致后续内容不可见
         const res = document.getElementById('result');
-        if (res) res.textContent = '';
+        if (res) {
+            // 清空现有内容并附加一个新的 Text 节点供后续增量写入
+            res.textContent = '';
+            try {
+                resultTextNode = document.createTextNode('');
+                res.appendChild(resultTextNode);
+            } catch (e) {
+                // 兜底：如果创建 Text 节点失败，至少保证区域为空
+                res.textContent = '';
+            }
+        }
+
+        // 重置匹配数显示
         matches = 0;
         document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
     } catch (e) {
