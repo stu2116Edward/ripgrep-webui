@@ -1,6 +1,6 @@
 Flask
 gunicorn
-flask-socketio
+flask-socketio==5.3.6
 gevent
 gevent-websocket
 py7zr
