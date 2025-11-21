@@ -13,6 +13,7 @@ import tempfile
 import shutil
 import queue
 import io
+import sys
 
 app = Flask(__name__)
 # 显式使用 gevent 并调整心跳参数，提升稳定性
@@ -39,6 +40,11 @@ def _on_disconnect():
         emit('message', {'message': 'Disconnected\n'})
     except Exception:
         pass
+    # 页面关闭或刷新会触发断连事件，这里触发一次热重载
+    try:
+        _trigger_hot_reload_async()
+    except Exception:
+        pass
 
 # 全局当前正在运行的 ripgrep 进程（read loop 读取这些进程的 stdout）
 proc = None
@@ -52,6 +58,10 @@ cancel_requested = False
 
 # 后台导出文件的流式写入句柄（按安全化后的关键字区分）
 export_streams = {}
+
+# 热重载控制：避免并发重复触发
+_restart_lock = threading.Lock()
+_restart_in_progress = False
 
 # 扩展的进度事件发射器（支持毫秒计时与字节进度）
 def emit_progress_ex(phase=None, file_type=None, elapsed_ms=None,
@@ -89,7 +99,7 @@ def emit_progress_ex(phase=None, file_type=None, elapsed_ms=None,
         # 保持后端健壮性，忽略单次发送失败
         pass
 
-# 新增：统一 UTF-8 文本发送包装，避免乱码
+# 统一 UTF-8 文本发送包装，避免乱码
 def emit_message_utf(text):
     try:
         if not isinstance(text, str):
@@ -1498,7 +1508,10 @@ def search():
                         pass
         else:
             # 目录搜索（默认）-> 包括压缩文件、归档和 Excel
-            regular_files = []
+            # 将常规文件细分为 csv_files / text_files / other_regular_files，
+            csv_files = []
+            text_files = []
+            other_regular_files = []
             compressed_files = []
             archive_files = []
             excel_files = []
@@ -1516,9 +1529,15 @@ def search():
                         compressed_files.append(full)
                     elif is_excel_file(fn_lower):
                         excel_files.append(full)
+                    elif is_csv_file(fn_lower):
+                        csv_files.append(full)
+                    elif fn_lower.endswith(TEXT_EXTS):
+                        text_files.append(full)
                     else:
-                        regular_files.append(full)
-            total_files = len(regular_files) + len(compressed_files) + len(excel_files)
+                        other_regular_files.append(full)
+            # 统计常规文件总数：CSV + TXT + 其他；归档的成员数在后续逐成员流式启动时叠加
+            total_files = (len(csv_files) + len(text_files) + len(other_regular_files)
+                           + len(compressed_files) + len(excel_files))
             # 对于存档，首先尝试使用 Python 库进行流式处理；如果流式处理成功，它将针对每个成员启动 rg
             for full_archive in archive_files:
                 streamed = False
@@ -1838,11 +1857,61 @@ def search():
                 except Exception:
                     continue
 
-            # 为非压缩文件启动主搜索：排除压缩/归档/Excel 文件以避免重复
-            # 说明：Excel 并非压缩文件，但这里仍从“主搜索”中排除
-            #      因为下方会对 excel_files 进行单独的主动流式检索，避免重复扫描
-            # 串行逐文件检索常规文件，确保完整枚举与稳定落盘
-            for full in regular_files:
+            # 为非压缩文件启动主搜索：按“CSV -> TXT -> 其他”顺序串行逐文件流式检索
+            # 说明：Excel 并非压缩文件，但这里仍从主搜索中排除，下方会单独处理
+            # 1) CSV 文件优先，使用专用 CSV 流式接口（64KB chunk，自动补尾换行）
+            for full in csv_files:
+                fn = os.path.basename(full)
+                fn_lower = fn.lower()
+                rel_label = os.path.relpath(full, data_dir)
+                def feed_fn(w, p=full, lb=rel_label, fl=fn_lower):
+                    size_c = None
+                    try:
+                        size_c = os.path.getsize(p)
+                    except Exception:
+                        size_c = None
+                    ft = classify_file_type(fl)
+                    def _cb(done, total, elapsed_ms, ft_local=ft, lb_local=lb):
+                        emit_progress_ex(
+                            phase='scan', file_type=ft_local,
+                            elapsed_ms=elapsed_ms, bytes_done=done, bytes_total=total,
+                            label=lb_local
+                        )
+                    try:
+                        with open(p, 'rb') as f:
+                            stream_csv_fileobj_to_writer(f, w, progress_cb=_cb, bytes_total=size_c)
+                    except Exception:
+                        pass
+                start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+
+            # 2) TXT 文件其次，降低块大小（64KB）以改善峰值内存占用
+            for full in text_files:
+                fn = os.path.basename(full)
+                fn_lower = fn.lower()
+                rel_label = os.path.relpath(full, data_dir)
+                def feed_fn(w, p=full, lb=rel_label, fl=fn_lower):
+                    size_c = None
+                    try:
+                        size_c = os.path.getsize(p)
+                    except Exception:
+                        size_c = None
+                    ft = classify_file_type(fl)
+                    def _cb(done, total, elapsed_ms, ft_local=ft, lb_local=lb):
+                        emit_progress_ex(
+                            phase='scan', file_type=ft_local,
+                            elapsed_ms=elapsed_ms, bytes_done=done, bytes_total=total,
+                            label=lb_local
+                        )
+                    try:
+                        with open(p, 'rb') as f:
+                            # 为 TXT 类文件降低分块大小，减少瞬时缓冲占用
+                            copy_fileobj_chunked(f, w, chunk_size=64 * 1024, progress_cb=_cb, bytes_total=size_c)
+                    except Exception:
+                        pass
+                start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
+
+            # 3) 其他常规文件最后，保持默认块大小
+            for full in other_regular_files:
                 fn = os.path.basename(full)
                 fn_lower = fn.lower()
                 rel_label = os.path.relpath(full, data_dir)
@@ -1864,8 +1933,7 @@ def search():
                             copy_fileobj_chunked(f, w, progress_cb=_cb, bytes_total=size_c)
                     except Exception:
                         pass
-                _p_reg = start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
-                # 移除阻塞等待，保持异步队列实时写入
+                start_rg_for_path('-', label=rel_label, python_stream_feed=feed_fn)
 
             # 为每个压缩文件（流式）启动 rg。优先使用外部工具；如果缺失，则使用 Python 流式输入
             for full in compressed_files:
@@ -2297,6 +2365,14 @@ def search():
             # 置空全局 proc（注意：proc 可能是第一个 rg）
             proc = None
 
+            # 释放对已结束子进程的全局引用，避免累计占用内存
+            # 说明：extra_procs 中保存了所有启动的 rg/解压器进程引用，
+            #       在正常完成时这些进程均已退出，应清空引用以便 GC。
+            try:
+                extra_procs = []
+            except Exception:
+                pass
+
             # 发送最终匹配数一次，确保前端能收到最终值
             try:
                 elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
@@ -2454,6 +2530,169 @@ def cancel():
         elapsed_ms_total = 0
     emit_progress_ex(phase='cancelled', elapsed_ms=elapsed_ms_total)
     return jsonify({"status": "cancelled"}), 200
+
+
+@app.route('/hot-reload', methods=['POST'])
+def hot_reload():
+    """清理当前搜索相关资源，并触发进程级重启以实现热重载。"""
+    started = _trigger_hot_reload_async()
+    if started:
+        return jsonify({"status": "restarting"}), 200
+    else:
+        return jsonify({"status": "restart_in_progress"}), 409
+
+def _trigger_hot_reload_async():
+    """封装热重载流程，便于在断连事件及路由中复用。返回 True 表示已启动，False 表示正在进行中。"""
+    global proc, extra_procs, temp_dirs, _proc_label_map, cancel_requested, _restart_in_progress
+
+    # 防重入：避免短时间内多次触发重启导致抖动
+    with _restart_lock:
+        if _restart_in_progress:
+            return False
+        _restart_in_progress = True
+
+    # 标记取消，阻止后台流继续写入
+    cancel_requested = True
+
+    # 安全关闭流的辅助函数
+    def _close_streams(p):
+        try:
+            if p:
+                try:
+                    s = getattr(p, 'stdin', None)
+                    if s: s.close()
+                except Exception:
+                    pass
+                try:
+                    s = getattr(p, 'stdout', None)
+                    if s: s.close()
+                except Exception:
+                    pass
+                try:
+                    s = getattr(p, 'stderr', None)
+                    if s: s.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # 强制终止进程（跨平台，优先关闭管道，其次温和终止，最后强杀）
+    def _terminate_proc(p):
+        if not p:
+            return
+        _close_streams(p)
+        try:
+            if hasattr(p, 'poll') and p.poll() is None:
+                if os.name != 'nt':
+                    try:
+                        pgid = os.getpgid(p.pid)
+                        os.killpg(pgid, signal.SIGTERM)
+                    except Exception:
+                        try:
+                            p.terminate()
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+
+                try:
+                    p.wait(timeout=0.5)
+                except Exception:
+                    pass
+
+                if hasattr(p, 'poll') and p.poll() is None:
+                    if os.name == 'nt':
+                        try:
+                            subprocess.run(['taskkill', '/PID', str(p.pid), '/T', '/F'],
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False)
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            try:
+                                pgid = os.getpgid(p.pid)
+                                os.killpg(pgid, signal.SIGKILL)
+                            except Exception:
+                                p.kill()
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        _close_streams(p)
+
+    # 1) 终止额外子进程（解压器等）
+    for p in list(extra_procs):
+        _terminate_proc(p)
+    extra_procs = []
+
+    # 2) 终止主检索进程
+    _terminate_proc(proc)
+
+    # 3) 清理临时目录
+    for d in list(temp_dirs):
+        try:
+            shutil.rmtree(d)
+        except Exception:
+            pass
+    temp_dirs = []
+
+    # 4) 关闭并清空导出流
+    close_all_export_streams()
+
+    # 5) 状态复位
+    proc = None
+    _proc_label_map = {}
+
+    # 6) 异步触发重启
+    def _do_restart():
+        try:
+            time.sleep(0.2)
+        except Exception:
+            pass
+        try:
+            # 容器环境优先：直接终止主进程以触发 Docker/Compose 重启
+            in_docker = False
+            try:
+                in_docker = os.path.exists('/.dockerenv') or bool(os.environ.get('IS_DOCKER') or os.environ.get('RUNNING_IN_DOCKER'))
+            except Exception:
+                in_docker = False
+
+            if in_docker:
+                try:
+                    # 如果当前为 gunicorn worker，尝试优雅终止 master
+                    try:
+                        os.kill(os.getppid(), signal.SIGTERM)
+                    except Exception:
+                        pass
+                    # 兜底：直接终止容器内的 PID 1（通常是 master/entrypoint）
+                    try:
+                        os.kill(1, signal.SIGTERM)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                os._exit(0)
+
+            # 非容器：Gunicorn 环境通知 master 重载并退出 worker
+            if os.environ.get('GUNICORN_CMD_ARGS'):
+                try:
+                    os.kill(os.getppid(), signal.SIGHUP)
+                except Exception:
+                    pass
+                os._exit(0)
+            else:
+                # 本地直接运行：执行自重启（进程替换）
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception:
+            os._exit(0)
+
+    t = threading.Thread(target=_do_restart, daemon=True)
+    t.start()
+
+    return True
 
 
 @app.route('/download')
