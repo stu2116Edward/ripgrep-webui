@@ -2,6 +2,7 @@
 Visual Text Content Retrieval Tool
 
 本项目是基于 https://github.com/BurntSushi/ripgrep 实现的webui可视化操作工具
+注意：在检索excel格式文件如`xls`,`xlsx`格式建议先转为csv格式（对于较大的excel格式文件会检索失败）
 
 ### 安装Docker环境
 使用脚本自行安装
