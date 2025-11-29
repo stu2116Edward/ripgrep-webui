@@ -20,8 +20,15 @@ RUN mkdir -p templates exports
 COPY rg /usr/bin/rg
 RUN chmod +x /usr/bin/rg
 
-# 复制应用代码（放在后面以利用缓存）
+# 复制应用代码
 COPY main.py .
+COPY config.py .
+COPY routes.py .
+COPY utils.py .
+COPY file_handlers.py .
+COPY search_engine.py .
+COPY process_manager.py .
+COPY export_manager.py .
 COPY templates/ ./templates/
 
 # 设置环境变量
