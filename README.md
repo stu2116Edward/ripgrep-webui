@@ -51,6 +51,11 @@ docker-compose up -d
 ## Windows
 本项目可以在windows中安装python环境并配置对应库直接运行  
 还需要在 https://github.com/BurntSushi/ripgrep/releases 下载所需的环境`ripgrep-15.1.0-x86_64-pc-windows-gnu.zip`  
+执行主函数：
+```
+python main.py
+```
+在浏览器中输入`127.0.0.1:5000`  
 数据目录即当前项目所在目录，把需要检索的文件直接放到该项目所在文件夹内即可  
 注意：检索数据的回退目录会在项目所在盘符下的如`E:\app\exports`目录中写入数据（自行清理和备份）  
 
