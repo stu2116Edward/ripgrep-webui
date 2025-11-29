@@ -313,6 +313,8 @@ let searchController = null;
 const inflightControllers = new Set();
 let wasCancelled = false;
 let currentFileName = '';
+// 标记是否收到过字节级进度，用于避免单文件的初始回退跳到高百分比
+let hasByteProgress = false;
 
 function classifyFileType(nameLower) {
     const n = (nameLower || '').toLowerCase();
@@ -369,20 +371,31 @@ function setProgressState(state, opts = {}) {
         showProgress();
         let pct = typeof opts.pct === 'number' ? opts.pct : 0;
         pct = Math.max(0, Math.min(100, pct));
-        bar.classList.remove('no-transition');
-        // 仅在最小变化达到 1% 时更新，降低重绘频率
-        const lastPct = parseFloat(bar.dataset.lastPct || '0');
-        if (Math.abs(pct - lastPct) >= 1) {
-            bar.style.width = pct + '%';
-            bar.dataset.lastPct = String(pct);
+        // 在新一次运行开始时（pct 为 0）强制重置历史进度，避免继承旧值
+        if (pct === 0) {
+            bar.dataset.lastPct = '0';
+            bar.style.width = '0%';
         }
-        // 移除条纹动画，使用静态色块以降低绘制成本
-        bar.className = 'progress-bar bg-info';
+        // 针对压缩/归档类型在运行阶段禁用过渡，减少抖动
+        if (fileType === 'compressed' || fileType === 'archive') {
+            bar.classList.add('no-transition');
+        } else {
+            bar.classList.remove('no-transition');
+        }
+        // 仅在最小变化达到 1% 时更新，降低重绘频率，同时保证进度单调递增
+        const lastPct = parseFloat(bar.dataset.lastPct || '0');
+        const targetPct = Math.max(lastPct, pct);
+        if (Math.abs(targetPct - lastPct) >= 1) {
+            bar.style.width = targetPct + '%';
+            bar.dataset.lastPct = String(targetPct);
+        }
+        // 使用静态色块以降低绘制成本
+        bar.className = 'progress-bar bg-info' + ((fileType === 'compressed' || fileType === 'archive') ? ' no-transition' : '');
         badge.className = 'badge badge-info progress-status-badge';
         badge.textContent = opts.text || '检索中';
         matchEl.textContent = `匹配：${matches} 条`;
-        if (Math.abs(pct - lastPct) >= 1) {
-            percent.textContent = pct + '%';
+        if (Math.abs(targetPct - lastPct) >= 1) {
+            percent.textContent = targetPct + '%';
         }
         if (opts.file) {
             currentFileName = opts.file;
@@ -494,6 +507,7 @@ socket.on('message', data => {
         running = false;
         pendingSubmit = false;
         wasCancelled = true;
+        hasByteProgress = false;
         setProgressState('cancelled');
         disableControls(false);
         document.getElementById('submitBtn').disabled = false;
@@ -510,6 +524,7 @@ socket.on('message', data => {
         pendingSubmit = false;
         wasCancelled = false;
         receivedChunks = 0;
+        hasByteProgress = false;
         matches = 0;
         files_total = 0;
         files_done = 0;
@@ -535,6 +550,7 @@ socket.on('message', data => {
         if (wasCancelled) return;
         running = false;
         pendingSubmit = false;
+        hasByteProgress = false;
         setProgressState('done', {fileType, preserveBarStyle: (fileType === 'compressed')});
         disableControls(false);
         document.getElementById('submitBtn').disabled = false;
@@ -583,18 +599,21 @@ socket.on('progress', data => {
     }
     let pct = 0;
     if (typeof data.bytes_done === 'number') {
+        hasByteProgress = true;
         const done = Math.max(0, data.bytes_done || 0);
         const total = Math.max(done, data.bytes_total || done);
         pct = total > 0 ? Math.floor((done / total) * 100) : 0;
     } else if (files_total && files_total > 0) {
         if (files_total === 1 && files_done === 0) {
-            const fallbackChunks = Math.min(95, Math.floor(receivedChunks * 2));
-            pct = Math.max(fallbackChunks, 0);
+            // 单文件尚未收到字节进度时，使用温和回退，最高不超过10%
+            const fallbackGentle = Math.min(10, Math.floor(receivedChunks / 30));
+            pct = Math.max(fallbackGentle, 0);
         } else {
             pct = Math.floor((files_done / files_total) * 100);
         }
     } else {
-        pct = Math.min(95, Math.floor(receivedChunks * 2));
+        // 未知总数时采用温和回退，避免过高跳跃
+        pct = Math.min(60, Math.floor(receivedChunks / 30));
     }
     const reachedByteCompletion = (typeof data.bytes_done === 'number' && typeof data.bytes_total === 'number' && data.bytes_total > 0 && data.bytes_done >= data.bytes_total);
     const reachedFileCompletion = (files_total > 0 && files_done >= files_total);
