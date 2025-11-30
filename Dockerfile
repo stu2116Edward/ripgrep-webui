@@ -1,19 +1,39 @@
-# 使用官方 Python 镜像作为基础镜像
-FROM python:3.9-slim
+# 构建阶段（使用完整镜像）
+FROM python:3.9-alpine AS builder
 
-# 设置工作目录
 WORKDIR /app
 
-# 复制 requirements.txt 并安装Python依赖
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 安装构建依赖
+RUN apk add --no-cache --virtual .build-deps \
+    gcc \
+    musl-dev \
+    linux-headers
 
-# 安装系统依赖
-RUN apt-get update && apt-get install -y \
-    p7zip-full \
-    unzip \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+# 复制 requirements.txt
+COPY requirements.txt .
+
+# 安装Python包
+RUN pip install --user --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 清理构建依赖
+RUN apk del .build-deps
+
+# 运行阶段（使用更小的基础镜像）
+FROM python:3.9-alpine
+
+WORKDIR /app
+
+# 安装运行时依赖
+RUN apk add --no-cache \
+    p7zip \
+    unzip
+
+# 从构建阶段复制已安装的Python包
+COPY --from=builder /root/.local /root/.local
+
+# 确保Python可以找到用户安装的包
+ENV PYTHONPATH=/root/.local/lib/python3.9/site-packages:/root/.local/lib/python3.9/site-packages
+ENV PATH=/root/.local/bin:$PATH
 
 # 创建必要的目录结构
 RUN mkdir -p templates exports
@@ -37,8 +57,9 @@ COPY templates/ ./templates/
 ENV GUNICORN_CMD_ARGS="-w 1 -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker --preload --max-requests 0 --timeout 0 --graceful-timeout 0 --keep-alive 30"
 ENV PYTHONUNBUFFERED="TRUE"
 
-# 验证 ripgrep 安装
-RUN rg --version
+# 验证安装
+RUN rg --version && \
+    python -c "import flask; print('Flask version:', flask.__version__)"
 
 # 暴露端口
 EXPOSE 5000
