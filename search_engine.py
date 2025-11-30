@@ -72,12 +72,6 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
         data_dir = os.path.dirname(__file__)
     data_dir_abs = os.path.abspath(data_dir)
 
-    # 预创建导出写入流（避免内存峰值）
-    try:
-        safe_kw_init = sanitize_keyword(keyword)
-        start_export_stream(safe_kw_init)
-    except Exception:
-        pass
 
     # 基本 rg 参数
     rg_base = ['rg', '-uuu', '--smart-case', '--json']
@@ -86,6 +80,13 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
     if not has_cmd('rg'):
         emit_message_utf('ripgrep 未安装或不可用，请在系统 PATH 中提供 rg。')
         return "rg not found"
+
+    # 预创建导出写入流（避免内存峰值，已确认 rg 可用）
+    try:
+        safe_kw_init = sanitize_keyword(keyword)
+        start_export_stream(safe_kw_init)
+    except Exception:
+        pass
 
     # 上下文参数
     if context_before and context_before > 0:
@@ -119,6 +120,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
     # 启动并管理若干 rg 进程
     all_rg_procs = []
     extra_procs_local = []
+    forward_threads_local = []
     total_files = 0
 
     try:
@@ -136,6 +138,15 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
             except Exception:
                 pass
             finally:
+                try:
+                    s = getattr(p, 'stdout', None)
+                    if s:
+                        try:
+                            s.close()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 q.put((None, pid))
 
         def _register_proc(rp):
@@ -194,6 +205,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
             try:
                 t = threading.Thread(target=forward_proc_stdout, args=(rg_proc,), daemon=True)
                 t.start()
+                forward_threads_local.append(t)
             except Exception:
                 pass
 
@@ -230,7 +242,13 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                     emit_progress_ex(phase='decompress', file_type='compressed',
                                                      elapsed_ms=elapsed_ms, bytes_done=done, bytes_total=total,
                                                      label=lb)
-                                spool_stream_to_temp_then_stream_excel(name, proc.stdout, w)
+                                try:
+                                    spool_stream_to_temp_then_stream_excel(name, proc.stdout, w)
+                                finally:
+                                    try:
+                                        proc.stdout.close()
+                                    except Exception:
+                                        pass
                             start_rg_for_path('-', label=label, python_stream_feed=feed_fn)
                         else:
                             def feed_fn(w, proc=decompress_proc, lb=label, orig=search_path_local):
@@ -243,7 +261,13 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                     emit_progress_ex(phase='decompress', file_type='compressed',
                                                      elapsed_ms=elapsed_ms, bytes_done=done, bytes_total=total,
                                                      label=lb)
-                                copy_fileobj_chunked(proc.stdout, w, progress_cb=_cb, bytes_total=size_c)
+                                try:
+                                    copy_fileobj_chunked(proc.stdout, w, progress_cb=_cb, bytes_total=size_c)
+                                finally:
+                                    try:
+                                        proc.stdout.close()
+                                    except Exception:
+                                        pass
                             start_rg_for_path('-', label=label, python_stream_feed=feed_fn)
                     except Exception:
                         # 回退到 Python 解压
@@ -749,6 +773,18 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
             except Exception:
                 pass
             pm.proc = None
+            try:
+                close_export_stream(sanitize_keyword(keyword))
+            except Exception:
+                pass
+            try:
+                pm.extra_procs.clear()
+            except Exception:
+                pass
+            try:
+                pm._proc_label_map.clear()
+            except Exception:
+                pass
             return "Started"
 
         # 标记主进程（用于 /cancel 检测）
@@ -1040,9 +1076,9 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                         try:
                             if p.poll() is None:
                                 try:
-                                    os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                                    pm._terminate_proc(p)
                                 except Exception:
-                                    p.terminate()
+                                    pass
                         except Exception:
                             pass
                 except Exception:
@@ -1063,6 +1099,20 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                 pm.proc = None
                 try:
                     close_export_stream(sanitize_keyword(keyword))
+                except Exception:
+                    pass
+                # 清理可能累积的全局附加进程引用
+                try:
+                    pm.extra_procs.clear()
+                except Exception:
+                    pass
+                # 等待前向读取线程结束
+                try:
+                    for t in forward_threads_local:
+                        try:
+                            t.join(timeout=0.5)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
@@ -1107,19 +1157,40 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
             # 清理
             for p in extra_procs_local:
                 try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                    pm._terminate_proc(p)
                 except Exception:
-                    try:
-                        p.terminate()
-                    except Exception:
-                        pass
+                    pass
             for d in pm.temp_dirs:
                 try:
                     shutil.rmtree(d)
                 except Exception:
                     pass
+            try:
+                pm.temp_dirs.clear()
+            except Exception:
+                pass
+            try:
+                pm._proc_label_map.clear()
+            except Exception:
+                pass
+            try:
+                for t in forward_threads_local:
+                    try:
+                        t.join(timeout=0.5)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             extra_procs_local = []
             pm.proc = None
+            try:
+                pm.extra_procs.clear()
+            except Exception:
+                pass
+            try:
+                close_export_stream(sanitize_keyword(keyword))
+            except Exception:
+                pass
             return "Error"
 
         return "Started"
@@ -1132,17 +1203,38 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
             pass
         for p in extra_procs_local:
             try:
-                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                pm._terminate_proc(p)
             except Exception:
-                try:
-                    p.terminate()
-                except Exception:
-                    pass
+                pass
         for d in pm.temp_dirs:
             try:
                 shutil.rmtree(d)
             except Exception:
                 pass
+        try:
+            pm.temp_dirs.clear()
+        except Exception:
+            pass
+        try:
+            pm._proc_label_map.clear()
+        except Exception:
+            pass
+        try:
+            for t in forward_threads_local:
+                try:
+                    t.join(timeout=0.5)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         extra_procs_local = []
         pm.proc = None
+        try:
+            pm.extra_procs.clear()
+        except Exception:
+            pass
+        try:
+            close_export_stream(sanitize_keyword(keyword))
+        except Exception:
+            pass
         return "Error"
