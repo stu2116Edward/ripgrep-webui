@@ -11,8 +11,5 @@ rarfile==4.0
 py7zr==0.20.8
 lz4==4.3.2
 
-# 系统工具
-psutil==5.9.5
-
 # 使用 Gunicorn 部署
 gunicorn==21.2.0
