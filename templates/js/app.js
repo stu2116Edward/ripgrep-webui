@@ -9,18 +9,38 @@ var socket = io({
     timeout: 20000
 });
 
-// 连接状态更新函数
+// 连接状态更新函数（含颜色映射与文案规范化）
 function setConnectionStatus(text) {
     const el = document.getElementById('connectStatus');
-    if (el) el.textContent = text || '';
+    if (!el) return;
+    // 统一文案：只保留“已连接 / 连接中 / 未连接”三种
+    let t = (text || '').trim();
+    if (t === '后台重载中...' || t === '连接异常') {
+        t = '连接中';
+    }
+    el.textContent = t || '';
+    // 颜色美化：按状态切换颜色类
+    el.classList.remove('text-success', 'text-warning', 'text-info', 'text-muted');
+    // 保持字号样式
+    el.classList.add('small');
+    if (t === '已连接') {
+        el.classList.add('text-success');
+    } else if (t === '连接中') {
+        el.classList.add('text-warning');
+    } else if (t === '未连接') {
+        el.classList.add('text-muted');
+    } else {
+        // 默认颜色（未连接或未知）
+        el.classList.add('text-muted');
+    }
 }
 
 // 监听连接相关事件，更新状态文本
-socket.on('connect', () => setConnectionStatus('已连接'));
+socket.on('connect', () => { setConnectionStatus('已连接'); try { fetchFileList(); } catch (e) {} });
 socket.on('disconnect', () => setConnectionStatus('未连接'));
-socket.on('connect_error', () => setConnectionStatus('连接异常'));
-socket.on('reconnect_attempt', () => setConnectionStatus('重连中...'));
-socket.on('reconnect', () => setConnectionStatus('已连接'));
+socket.on('connect_error', () => setConnectionStatus('连接中'));
+socket.on('reconnect_attempt', () => setConnectionStatus('连接中'));
+socket.on('reconnect', () => { setConnectionStatus('已连接'); try { fetchFileList(); } catch (e) {} });
 
 
 // === 结果缓冲与渲染 ===
@@ -271,6 +291,39 @@ function disableControls(val) {
     if (exportBtn) exportBtn.disabled = false;
 }
 
+// === 文件列表加载/刷新 ===
+function populateFileSelect(list) {
+    const sel = document.getElementById('file');
+    if (!sel) return;
+    const prev = sel.value;
+    // 重新构建选项，避免重复
+    sel.innerHTML = '';
+    const optAll = document.createElement('option');
+    optAll.value = '__ALL__';
+    optAll.textContent = '检索全部文件';
+    sel.appendChild(optAll);
+    if (Array.isArray(list) && list.length > 0) {
+        list.forEach(fn => {
+            const opt = document.createElement('option');
+            opt.value = fn;
+            opt.textContent = fn;
+            sel.appendChild(opt);
+        });
+    }
+    if (prev && Array.from(sel.options).some(o => o.value === prev)) {
+        sel.value = prev;
+    } else {
+        sel.value = '__ALL__';
+    }
+}
+
+function fetchFileList() {
+    return trackedFetch('/files', {}, true)
+        .then(r => r.ok ? r.json() : Promise.reject())
+        .then(list => populateFileSelect(list))
+        .catch(() => {});
+}
+
 // === 页面初始化 ===
 window.addEventListener('DOMContentLoaded', function(){
     // 初始化结果区域为单一 Text 节点，降低后续写入的重排/复制成本
@@ -282,22 +335,12 @@ window.addEventListener('DOMContentLoaded', function(){
 
     // 触发容器内进程热重载：每次页面打开或刷新时调用
     try {
-        setConnectionStatus('后台重载中...');
+        setConnectionStatus('连接中');
         trackedFetch('/hot-reload', { method: 'POST' }, true).catch(() => {});
     } catch (e) {}
 
-    trackedFetch('/files', {}, true)
-    .then(r => r.ok ? r.json() : Promise.reject())
-    .then(list => {
-        const sel = document.getElementById('file');
-        if (Array.isArray(list) && list.length > 0) {
-            list.forEach(fn => {
-                const opt = document.createElement('option');
-                opt.value = fn; opt.textContent = fn;
-                sel.appendChild(opt);
-            });
-        }
-    }).catch(() => {});
+    // 初次加载文件列表，同时在连接恢复时也会自动刷新
+    fetchFileList();
     setProgressState('idle');
     const cancelBtnEl = document.getElementById('cancelBtn');
     cancelBtnEl.addEventListener('click', function(e){
