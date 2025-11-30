@@ -4,14 +4,16 @@ FROM python:3.9-slim
 # 设置工作目录
 WORKDIR /app
 
-# 先复制 requirements.txt 并安装依赖（利用 Docker 缓存层）
+# 复制 requirements.txt 并安装Python依赖
 COPY requirements.txt .
-
-# 安装依赖
 RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# 安装 7z 等系统工具以支持无落盘流式处理 .rar/.7z
-RUN apt-get update && apt-get install -y --no-install-recommends p7zip-full libarchive-tools unzip && rm -rf /var/lib/apt/lists/*
+# 安装系统依赖
+RUN apt-get update && apt-get install -y \
+    p7zip-full \
+    unzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
 # 创建必要的目录结构
 RUN mkdir -p templates exports
@@ -32,7 +34,7 @@ COPY export_manager.py .
 COPY templates/ ./templates/
 
 # 设置环境变量
-ENV GUNICORN_CMD_ARGS="-w 1 -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker --preload --max-requests 1000 --max-requests-jitter 100 --timeout 0 --graceful-timeout 0 --keep-alive 30"
+ENV GUNICORN_CMD_ARGS="-w 1 -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker --preload --max-requests 0 --timeout 0 --graceful-timeout 0 --keep-alive 30"
 ENV PYTHONUNBUFFERED="TRUE"
 
 # 验证 ripgrep 安装
