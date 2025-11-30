@@ -16,12 +16,37 @@ _EXPORTS_DIR = '/app/exports'
 
 
 def get_exports_dir():
-    """统一导出目录选择：固定为 /app/exports（Docker 容器卷）。"""
+    """统一导出目录选择：容器优先使用 /app/exports，本地环境回退到项目内 exports 目录。"""
     try:
-        os.makedirs(_EXPORTS_DIR, exist_ok=True)
+        base = _EXPORTS_DIR
+        # 优先尝试创建容器卷目录
+        try:
+            os.makedirs(base, exist_ok=True)
+        except Exception:
+            base = os.path.join(os.path.dirname(__file__), 'exports')
+            try:
+                os.makedirs(base, exist_ok=True)
+            except Exception:
+                pass
+
+        # 如果不可写则回退到项目本地目录
+        try:
+            if not os.access(base, os.W_OK):
+                fallback = os.path.join(os.path.dirname(__file__), 'exports')
+                os.makedirs(fallback, exist_ok=True)
+                base = fallback
+        except Exception:
+            pass
+
+        return base
     except Exception:
-        pass
-    return _EXPORTS_DIR
+        # 兜底：始终尝试项目内 exports
+        fallback = os.path.join(os.path.dirname(__file__), 'exports')
+        try:
+            os.makedirs(fallback, exist_ok=True)
+        except Exception:
+            pass
+        return fallback
 
 
 def start_export_stream(safe_kw: str):
