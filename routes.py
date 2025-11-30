@@ -77,9 +77,15 @@ def route_search():
     keyword = (data.get('keyword') or '').strip()
     if not keyword:
         return "Missing keyword", 400
-
-    before = int(data.get('context_before', 0) or 0)
-    after = int(data.get('context_after', 0) or 0)
+    # 更稳健的数字解析，避免非法输入造成 500
+    try:
+        before = int(data.get('context_before', 0) or 0)
+    except Exception:
+        before = 0
+    try:
+        after = int(data.get('context_after', 0) or 0)
+    except Exception:
+        after = 0
     file = (data.get('file') or '').strip()
 
     status = start_search(keyword=keyword, context_before=before, context_after=after, file=file)
