@@ -475,12 +475,16 @@ socket.on('progress', data => {
     }
     const reachedByteCompletion = (typeof data.bytes_done === 'number' && typeof data.bytes_total === 'number' && data.bytes_total > 0 && data.bytes_done >= data.bytes_total);
     const reachedFileCompletion = (files_total > 0 && files_done >= files_total);
-    if (running && !(reachedByteCompletion || reachedFileCompletion)) {
-        pct = Math.min(99, Math.max(0, pct));
+    const reachedSearchEnd = (data && data.phase === 'search_end');
+    // 在压缩/归档类型中，字节完成并不代表匹配统计完成，保持进度在95%，等待文件完成/搜索结束事件
+    const bytesCompleteButNotFiles = reachedByteCompletion && !reachedFileCompletion && (fileType === 'compressed' || fileType === 'archive');
+    if (running && (bytesCompleteButNotFiles || !(reachedByteCompletion || reachedFileCompletion))) {
+        pct = Math.min(95, Math.max(0, pct));
     } else {
         pct = Math.min(100, Math.max(0, pct));
     }
-    if (reachedFileCompletion || ((fileType === 'compressed' || fileType === 'archive') && reachedByteCompletion)) {
+    // 仅当文件完成或收到搜索结束事件时才标记完成，避免压缩文件过早结束
+    if (reachedFileCompletion || reachedSearchEnd) {
         running = false;
         setProgressState('done', {fileType, preserveBarStyle: (fileType === 'compressed')});
         disableControls(false);
@@ -582,7 +586,12 @@ async function singleSearch(kw, before, after, file) {
                 resolve(); 
             };
             const handler = (data) => {
-                if (data.message && (data.message.includes('Done') || data.message.includes('Cancelled'))) onDone();
+                if (data && typeof data.message === 'string') {
+                    const msg = data.message;
+                    if (msg.includes('Done') || msg.includes('Cancelled') || msg.includes('Busy')) {
+                        onDone();
+                    }
+                }
             };
             const progressHandler = (data) => {
                 if (typeof data.matches === 'number') {
