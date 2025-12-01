@@ -15,6 +15,7 @@ import signal
 import threading
 import subprocess
 import tempfile
+import gc
 
 from config import DEFAULT_DATA_DIR, EXCEL_EXTS, CSV_EXTS, TEXT_EXTS
 from utils import (
@@ -52,7 +53,7 @@ def check_rg_supports_label():
         return _RG_SUPPORTS_LABEL
 
 
-def start_search(keyword: str, context_before: int, context_after: int, file: str):
+def start_search(keyword: str, context_before: int, context_after: int, file: str, scope_override: str = None, reset_all: bool = False, final_all: bool = False):
     """
     启动搜索：复用原始流程与细节，返回字符串状态（'Started' 或错误字符串）。
     """
@@ -81,10 +82,26 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
         emit_message_utf('ripgrep 未安装或不可用，请在系统 PATH 中提供 rg。')
         return "rg not found"
 
-    # 预创建导出写入流（避免内存峰值，已确认 rg 可用）
+    # 预创建/管理导出写入流：
+    # - all 模式：在本次提交的第一次调用（reset_all=True）创建新文件；后续调用复用同一会话写入流
+    # - single 模式：每次调用创建新的单文件导出
     try:
         safe_kw_init = sanitize_keyword(keyword)
-        start_export_stream(safe_kw_init)
+        scope = 'all' if (file == '__ALL__') else 'single'
+        if scope_override in ('all', 'single'):
+            scope = scope_override
+        if scope == 'all':
+            if reset_all:
+                try:
+                    close_export_stream(safe_kw_init)
+                except Exception:
+                    pass
+                start_export_stream(safe_kw_init, scope='all')
+            else:
+                # 复用现有会话：若尚未初始化，将在首次 append 时懒加载
+                pass
+        else:
+            start_export_stream(safe_kw_init, scope='single')
     except Exception:
         pass
 
@@ -774,7 +791,8 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                 pass
             pm.proc = None
             try:
-                close_export_stream(sanitize_keyword(keyword))
+                if scope == 'single' or (scope == 'all' and final_all):
+                    close_export_stream(sanitize_keyword(keyword))
             except Exception:
                 pass
             try:
@@ -890,7 +908,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                 owner_current_label[owner] = label_text
                                 try:
                                     if str(label_text).strip().lower() != '<stdin>':
-                                        append_export_text(safe_kw, f"[{label_text}]\n")
+                                        append_export_text(safe_kw, f"[{label_text}]\n", scope=scope)
                                 except Exception:
                                     pass
                             owner_has_output[owner] = False
@@ -910,7 +928,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                 if len(before_lines) > context_before_n:
                                     before_lines.pop(0)
                             else:
-                                append_export_text(safe_kw, line_text + '\n')
+                                append_export_text(safe_kw, line_text + '\n', scope=scope)
                                 emit_message_utf(line_text + '\n')
                                 owner_has_output[owner] = True
                                 after_emit_count += 1
@@ -942,16 +960,16 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                             if not block_ready:
                                 if not first_block:
                                     try:
-                                        append_export_text(safe_kw, '\n')
+                                        append_export_text(safe_kw, '\n', scope=scope)
                                         emit_message_utf('\n')
                                         owner_has_output[owner] = True
                                     except Exception:
                                         pass
                                 for t in before_lines:
-                                    append_export_text(safe_kw, t + '\n')
+                                    append_export_text(safe_kw, t + '\n', scope=scope)
                                     emit_message_utf(t + '\n')
                                     owner_has_output[owner] = True
-                                append_export_text(safe_kw, line_text + '\n')
+                                append_export_text(safe_kw, line_text + '\n', scope=scope)
                                 emit_message_utf(line_text + '\n')
                                 owner_has_output[owner] = True
                                 block_main = line_text
@@ -976,7 +994,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                             else:
                                 try:
                                     while after_emit_count < context_after_n:
-                                        append_export_text(safe_kw, '\n')
+                                        append_export_text(safe_kw, '\n', scope=scope)
                                         emit_message_utf('\n')
                                         owner_has_output[owner] = True
                                         after_emit_count += 1
@@ -992,10 +1010,10 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
 
                                 for i in range(context_before_n):
                                     t = before_lines[i] if i < len(before_lines) else ''
-                                    append_export_text(safe_kw, t + '\n')
+                                    append_export_text(safe_kw, t + '\n', scope=scope)
                                     emit_message_utf(t + '\n')
                                     owner_has_output[owner] = True
-                                append_export_text(safe_kw, line_text + '\n')
+                                append_export_text(safe_kw, line_text + '\n', scope=scope)
                                 emit_message_utf(line_text + '\n')
                                 owner_has_output[owner] = True
                                 block_main = line_text
@@ -1009,7 +1027,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                             if block_ready:
                                 try:
                                     while after_emit_count < context_after_n:
-                                        append_export_text(safe_kw, '\n')
+                                        append_export_text(safe_kw, '\n', scope=scope)
                                         emit_message_utf('\n')
                                         owner_has_output[owner] = True
                                         after_emit_count += 1
@@ -1038,7 +1056,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
 
                             try:
                                 if owner_has_output.get(owner):
-                                    append_export_text(safe_kw, '\n')
+                                    append_export_text(safe_kw, '\n', scope=scope)
                                     emit_message_utf('\n')
                                     owner_has_output[owner] = False
                             except Exception:
@@ -1060,6 +1078,39 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                     files_done=files_done,
                                     label=label_text
                                 )
+                            except Exception:
+                                pass
+
+                            # 每个文件检索完成后主动回收局部状态与触发垃圾回收，降低长跑内存占用
+                            try:
+                                # 清理与该 owner 相关的临时映射，避免集合无限增长
+                                try:
+                                    owner_current_label.pop(owner, None)
+                                except Exception:
+                                    pass
+                                try:
+                                    owner_has_output.pop(owner, None)
+                                except Exception:
+                                    pass
+                                try:
+                                    pm._proc_label_map.pop(owner, None)
+                                except Exception:
+                                    pass
+                                # 释放可能较大的上下文缓存
+                                try:
+                                    before_lines = []
+                                    after_lines = []
+                                    block_main = None
+                                    block_ready = False
+                                    block_match_count = 0
+                                    after_emit_count = 0
+                                except Exception:
+                                    pass
+                                # 触发一次垃圾回收（轻量，确保大型对象尽快回收）
+                                try:
+                                    gc.collect()
+                                except Exception:
+                                    pass
                             except Exception:
                                 pass
 
@@ -1098,7 +1149,8 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                     pass
                 pm.proc = None
                 try:
-                    close_export_stream(sanitize_keyword(keyword))
+                    if scope == 'single' or (scope == 'all' and final_all):
+                        close_export_stream(sanitize_keyword(keyword))
                 except Exception:
                     pass
                 # 清理可能累积的全局附加进程引用
@@ -1188,7 +1240,8 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
             except Exception:
                 pass
             try:
-                close_export_stream(sanitize_keyword(keyword))
+                if scope == 'single' or (scope == 'all' and final_all):
+                    close_export_stream(sanitize_keyword(keyword))
             except Exception:
                 pass
             return "Error"
@@ -1234,7 +1287,8 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
         except Exception:
             pass
         try:
-            close_export_stream(sanitize_keyword(keyword))
+            if scope == 'single' or (scope == 'all' and final_all):
+                close_export_stream(sanitize_keyword(keyword))
         except Exception:
             pass
         return "Error"
