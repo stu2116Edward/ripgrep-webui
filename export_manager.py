@@ -9,6 +9,7 @@ import os
 import time
 import queue
 import threading
+import gc
 
 # 后台导出文件的流式写入句柄（按安全化后的关键字区分）
 export_streams = {}
@@ -144,6 +145,28 @@ def close_export_stream(safe_kw: str):
             return
         q = info.get('queue')
         t = info.get('thread')
+        # 在发送终止标志之前尽量清空队列，避免大文本在内存中排队等待写盘
+        try:
+            if q:
+                try:
+                    # 优先使用内部队列快速清空（带锁，尽量安全）
+                    if hasattr(q, 'mutex') and hasattr(q, 'queue'):
+                        with q.mutex:
+                            try:
+                                q.queue.clear()
+                            except Exception:
+                                # 兜底：逐条非阻塞清空
+                                pass
+                    # 兜底再次尝试逐条非阻塞清理
+                    while True:
+                        try:
+                            q.get_nowait()
+                        except Exception:
+                            break
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             if q:
                 q.put(None)
@@ -168,6 +191,11 @@ def close_export_stream(safe_kw: str):
                 fh.close()
             except Exception:
                 pass
+        # 主动触发一次垃圾回收，加速释放写入缓冲与队列残留对象
+        try:
+            gc.collect()
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -176,7 +204,14 @@ def close_all_export_streams():
     """关闭所有导出流（用于取消或搜索结束清理）。"""
     try:
         for safe_kw in list(export_streams.keys()):
-            close_export_stream(safe_kw)
+            try:
+                close_export_stream(safe_kw)
+            except Exception:
+                pass
         export_streams.clear()
+        try:
+            gc.collect()
+        except Exception:
+            pass
     except Exception:
         pass
