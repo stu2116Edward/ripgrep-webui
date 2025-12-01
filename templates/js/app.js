@@ -56,6 +56,34 @@ const FLUSH_CHUNK_SIZE = 65536;   // 以 64KB 分块追加，避免一次性大�
 let resultBuffer = '';
 let flushScheduled = false;
 
+// === 预览设置（刷新页面或重启容器后生效） ===
+const PREVIEW_KEY = 'preview_enabled';
+// previewEnabled: 当前检索会话的实际预览状态；previewPref: 用户偏好，下一次提交时生效
+let previewEnabled = true;
+let previewPref = true;
+try {
+    const stored = localStorage.getItem(PREVIEW_KEY);
+    previewPref = (stored === '0') ? false : true;
+    // 页面首次加载时（尚未开始检索）使用偏好作为当前会话状态
+    previewEnabled = previewPref;
+} catch (e) {
+    previewPref = true;
+    previewEnabled = true;
+}
+
+function setupPreviewToggle() {
+    const el = document.getElementById('previewToggle');
+    if (!el) return;
+    // 初始化为当前偏好状态
+    try { el.checked = !!previewPref; } catch (e) {}
+    // 切换时仅持久化偏好；不改变当前正在进行中的会话预览状态
+    el.addEventListener('change', function(){
+        previewPref = !!el.checked;
+        try { localStorage.setItem(PREVIEW_KEY, previewPref ? '1' : '0'); } catch (e) {}
+        // 注意：不即时应用到 previewEnabled；在下一次提交检索时应用
+    });
+}
+
 // 将文本加入缓冲区
 function enqueueResult(text) {
     // 始终以字符串形式累计
@@ -73,6 +101,11 @@ function scheduleFlush() {
 // 立即将缓冲区内容写入结果区域（分块写入)
 function flushResultNow() {
     try {
+        if (!previewEnabled) {
+            resultBuffer = '';
+            flushScheduled = false;
+            return;
+        }
         if (resultBuffer && resultBuffer.length > 0) {
             if (resultTextNode && typeof resultTextNode.appendData === 'function') {
                 // 分块写入，降低长字符串追加带来的阻塞
@@ -85,13 +118,14 @@ function flushResultNow() {
                 }
                 // 超过阈值时只保留最后 MAX_RESULT_CHARS 的内容
                 if (resultTextNode.data && resultTextNode.data.length > TRIM_AT_CHARS) {
-                    resultTextNode.data = resultTextNode.data.slice(-MAX_RESULT_CHARS);
+                    const d = resultTextNode.data;
+                    resultTextNode.data = (MAX_RESULT_CHARS > 0) ? d.slice(-MAX_RESULT_CHARS) : '';
                 }
             } else {
-                // 兜底：如果 Text 节点不可用，退回 textContent 方式
                 resultEl.textContent = resultEl.textContent + resultBuffer;
                 if (resultEl.textContent.length > TRIM_AT_CHARS) {
-                    resultEl.textContent = resultEl.textContent.slice(-MAX_RESULT_CHARS);
+                    const d = resultEl.textContent;
+                    resultEl.textContent = (MAX_RESULT_CHARS > 0) ? d.slice(-MAX_RESULT_CHARS) : '';
                 }
             }
             resultBuffer = '';
@@ -109,8 +143,7 @@ function compactResultIfLarge() {
         try { flushResultNow(); } catch (e) {}
         const current = (resultTextNode && resultTextNode.data) ? resultTextNode.data : (res.textContent || '');
         if (current && current.length > MAX_RESULT_CHARS) {
-            const tail = current.slice(-MAX_RESULT_CHARS);
-            // 替换为新的 Text 节点，有助于释放旧字符串的内存占用
+            const tail = (MAX_RESULT_CHARS > 0) ? current.slice(-MAX_RESULT_CHARS) : '';
             const t = document.createTextNode(tail);
             res.textContent = '';
             try { res.appendChild(t); } catch (e) {}
@@ -126,7 +159,7 @@ function aggressiveCompactResult() {
         if (!res) return;
         try { flushResultNow(); } catch (e) {}
         const current = (resultTextNode && resultTextNode.data) ? resultTextNode.data : (res.textContent || '');
-        const tail = current.slice(-MAX_RESULT_CHARS);
+        const tail = (MAX_RESULT_CHARS > 0) ? current.slice(-MAX_RESULT_CHARS) : '';
         const t = document.createTextNode(tail);
         res.textContent = '';
         try { res.appendChild(t); } catch (e) {}
@@ -134,8 +167,56 @@ function aggressiveCompactResult() {
     } catch (e) {}
 }
 
+// 更彻底的前端内存回收：释放结果区所有文本与缓冲引用
+function hardResetResults(tag) {
+    try {
+        // 先尝试刷新缓冲再清空，以免残留未写入的数据影响后续状态
+        try { flushResultNow(); } catch (e) {}
+
+        // 清空缓冲与写入计划
+        try { resultBuffer = ''; } catch (e) {}
+        try { flushScheduled = false; } catch (e) {}
+
+        // 释放结果区域所有文本，断开旧 Text 节点引用，重新创建轻量节点用于后续增量写入
+        const res = document.getElementById('result');
+        if (res) {
+            try { res.textContent = ''; } catch (e) {}
+            try { resultTextNode = null; } catch (e) {}
+            try {
+                const t = document.createTextNode('');
+                res.appendChild(t);
+                resultTextNode = t;
+            } catch (e) {}
+        }
+
+        // 重置与进度相关的轻量状态，避免后续 UI 抖动占用
+        try { hasByteProgress = false; } catch (e) {}
+        try { receivedChunks = 0; } catch (e) {}
+
+        // 可选：记录一次内存状态，便于诊断
+        try { reportMemory(tag || 'reset'); } catch (e) {}
+    } catch (e) {}
+}
+
+// 轻量级内存报告：用于在导出或清空后观测是否回收
+function reportMemory(tag) {
+    try {
+        // Chrome 专有 API：仅在支持时输出
+        const p = (performance && performance.memory) ? performance.memory : null;
+        if (p) {
+            console.info(`[mem] ${tag}: used=${p.usedJSHeapSize}, total=${p.totalJSHeapSize}, limit=${p.jsHeapSizeLimit}`);
+        }
+    } catch (e) {}
+}
+
 // 根据检索模式动态调整尾部保留与裁剪阈值
 function reconfigureRetentionForMode(isSearchAll) {
+    // 若关闭预览，则不保留结果文本，最大限度降低内存
+    if (!previewEnabled) {
+        MAX_RESULT_CHARS = 0;
+        TRIM_AT_CHARS = 0;
+        return;
+    }
     // 多文件模式下收敛到 1MB 尾部，降低累计文本占用；单文件保持 2MB
     MAX_RESULT_CHARS = isSearchAll ? 1000000 : 2000000;
     TRIM_AT_CHARS = Math.floor(MAX_RESULT_CHARS * 1.25);
@@ -359,6 +440,9 @@ window.addEventListener('DOMContentLoaded', function(){
         resultEl.appendChild(resultTextNode);
     } catch (e) {}
 
+    // 初始化预览开关（设置在刷新后生效）
+    try { setupPreviewToggle(); } catch (e) {}
+
     // 触发容器内进程热重载：每次页面打开或刷新时调用
     try {
         setConnectionStatus('连接中');
@@ -396,8 +480,8 @@ socket.on('message', data => {
         document.getElementById('submitBtn').disabled = false;
         clearTimeout(progressHideTimeout);
         progressHideTimeout = setTimeout(() => hideProgress(), 1200);
-        // 取消后主动压缩一次结果，保证后续内存稳定
-        aggressiveCompactResult();
+        // 取消后执行硬重置，确保结果区内存彻底释放
+        hardResetResults('cancelled');
         return;
     }
 
@@ -439,18 +523,23 @@ socket.on('message', data => {
         document.getElementById('submitBtn').disabled = false;
         clearTimeout(progressHideTimeout);
         progressHideTimeout = setTimeout(() => hideProgress(), 1200);
-        // 完成后主动压缩一次结果，保证后续内存稳定
-        aggressiveCompactResult();
+        // 若开启预览，保留已展示内容，仅进行压缩以降低占用；
+        // 若关闭预览，则进行彻底重置以回收前端内存。
+        if (previewEnabled) {
+            try { aggressiveCompactResult(); } catch (e) {}
+        } else {
+            hardResetResults('done');
+        }
         return;
     }
 
     if (/^\s*\?\?/.test(text)) return;
 
     if (text.trim().length > 0) {
-        enqueueResult(text);
+        if (previewEnabled) enqueueResult(text);
         receivedChunks++;
     } else {
-        enqueueResult(text);
+        if (previewEnabled) enqueueResult(text);
     }
 });
 
@@ -548,8 +637,11 @@ async function sendKeyword() {
     const fileSel = document.getElementById('file');
     const file = fileSel.value;
 
-    // 记录当前是否为“检索全部文件”模式，并按模式调整保留参数
+    // 记录当前是否为“检索全部文件”模式
     lastSearchAll = (file === '__ALL__');
+    // 在开始新检索时才应用预览偏好到当前会话
+    previewEnabled = !!previewPref;
+    // 按当前会话预览状态和模式调整保留参数
     reconfigureRetentionForMode(lastSearchAll);
 
     if (file === '__ALL__') {
@@ -756,6 +848,10 @@ function exportResult() {
     if (clearedAfterSearch) {
         try { console.info('提示：已清空，导出的是后端文件。'); } catch (e) {}
     }
+
+    // 导出完成后主动进行一次压缩，以便释放前端大文本的内存占用
+    try { compactResultIfLarge(); } catch (e) {}
+    try { reportMemory('after_export'); } catch (e) {}
 }
 
 window.addEventListener('beforeunload', () => {
