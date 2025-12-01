@@ -48,8 +48,8 @@ socket.on('reconnect', () => { setConnectionStatus('已连接'); try { fetchFile
 const resultEl = document.getElementById('result');
 // 使用单一 Text 节点减少对已有大文本的复制，降低卡顿
 let resultTextNode = null;
-const MAX_RESULT_CHARS = 2000000; // 保留最近 ~2MB 文本，防止内存无限增长
-const TRIM_AT_CHARS = 2500000;    // 超过阈值再裁剪，减少频繁复制
+let MAX_RESULT_CHARS = 2000000; // 保留最近 ~2MB 文本，防止内存无限增长
+let TRIM_AT_CHARS = 2500000;    // 超过阈值再裁剪，减少频繁复制
 const FLUSH_CHUNK_SIZE = 65536;   // 以 64KB 分块追加，避免一次性大字符串阻塞
 
 // 结果文本缓冲：批量 append，减少频繁的 DOM 触发
@@ -119,6 +119,28 @@ function compactResultIfLarge() {
     } catch (e) {}
 }
 
+// 更激进的压缩：无论当前大小都重建 Text 节点，仅保留尾部 MAX_RESULT_CHARS
+function aggressiveCompactResult() {
+    try {
+        const res = document.getElementById('result');
+        if (!res) return;
+        try { flushResultNow(); } catch (e) {}
+        const current = (resultTextNode && resultTextNode.data) ? resultTextNode.data : (res.textContent || '');
+        const tail = current.slice(-MAX_RESULT_CHARS);
+        const t = document.createTextNode(tail);
+        res.textContent = '';
+        try { res.appendChild(t); } catch (e) {}
+        resultTextNode = t;
+    } catch (e) {}
+}
+
+// 根据检索模式动态调整尾部保留与裁剪阈值
+function reconfigureRetentionForMode(isSearchAll) {
+    // 多文件模式下收敛到 1MB 尾部，降低累计文本占用；单文件保持 2MB
+    MAX_RESULT_CHARS = isSearchAll ? 1000000 : 2000000;
+    TRIM_AT_CHARS = Math.floor(MAX_RESULT_CHARS * 1.25);
+}
+
 // === 运行状态与分类 ===
 let running = false;
 let pendingSubmit = false;
@@ -136,6 +158,10 @@ let wasCancelled = false;
 let currentFileName = '';
 // 标记是否收到过字节级进度，用于避免单文件的初始回退跳到高百分比
 let hasByteProgress = false;
+// 标记上一次检索是否为“全部文件”模式，用于导出逻辑选择
+let lastSearchAll = false;
+// 标记是否已点击“清空”按钮，用于导出按钮仅提示
+let clearedAfterSearch = false;
 
 // 根据文件扩展名粗略分类，用于调整进度条动画策略
 function classifyFileType(nameLower) {
@@ -371,7 +397,7 @@ socket.on('message', data => {
         clearTimeout(progressHideTimeout);
         progressHideTimeout = setTimeout(() => hideProgress(), 1200);
         // 取消后主动压缩一次结果，保证后续内存稳定
-        compactResultIfLarge();
+        aggressiveCompactResult();
         return;
     }
 
@@ -414,7 +440,7 @@ socket.on('message', data => {
         clearTimeout(progressHideTimeout);
         progressHideTimeout = setTimeout(() => hideProgress(), 1200);
         // 完成后主动压缩一次结果，保证后续内存稳定
-        compactResultIfLarge();
+        aggressiveCompactResult();
         return;
     }
 
@@ -492,7 +518,7 @@ socket.on('progress', data => {
         clearTimeout(progressHideTimeout);
         progressHideTimeout = setTimeout(() => hideProgress(), 1200);
         // 进度判断到达完成时也压缩一次结果，消除顺序差异的占用
-        compactResultIfLarge();
+        aggressiveCompactResult();
         return;
     }
     const now = Date.now();
@@ -514,11 +540,17 @@ async function sendKeyword() {
     lastSubmitAt = now;
     pendingSubmit = true;
     wasCancelled = false;
+    // 开始新检索时重置清空标记
+    clearedAfterSearch = false;
 
     const before = parseInt(document.getElementById('context_before').value || '0', 10);
     const after  = parseInt(document.getElementById('context_after').value || '0', 10);
     const fileSel = document.getElementById('file');
     const file = fileSel.value;
+
+    // 记录当前是否为“检索全部文件”模式，并按模式调整保留参数
+    lastSearchAll = (file === '__ALL__');
+    reconfigureRetentionForMode(lastSearchAll);
 
     if (file === '__ALL__') {
         const list = await trackedFetch('/files').then(r => r.ok ? r.json() : Promise.reject()).catch(() => []);
@@ -529,9 +561,12 @@ async function sendKeyword() {
         matches = 0;
         document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
         
-        for (const f of list) {
+        for (let i = 0; i < list.length; i++) {
+            const f = list[i];
             if (wasCancelled) break;
-            const fileMatches = await singleSearch(kw, before, after, f);
+            const isFirst = (i === 0);
+            const isLast = (i === list.length - 1);
+            const fileMatches = await singleSearch(kw, before, after, f, 'all', isFirst, isLast);
             if (typeof fileMatches === 'number') {
                 totalMatches += fileMatches;
                 matches = totalMatches;
@@ -539,7 +574,7 @@ async function sendKeyword() {
             }
             
             // 在进行下一个文件检索前添加1秒缓冲时间
-            if (list.indexOf(f) < list.length - 1 && !wasCancelled) {
+            if (i < list.length - 1 && !wasCancelled) {
                 await new Promise(resolve => setTimeout(resolve, 1000));
             }
         }
@@ -558,7 +593,7 @@ async function sendKeyword() {
  * @param {string} file - 文件路径/名称
  * @returns {Promise<number>} - 当前文件的匹配总数
  */
-async function singleSearch(kw, before, after, file) {
+async function singleSearch(kw, before, after, file, scope, resetAll = false, finalAll = false) {
     fileType = classifyFileType(file.toLowerCase());
     receivedChunks = 0;
     let currentFileMatches = 0; // 当前文件的匹配数
@@ -570,10 +605,14 @@ async function singleSearch(kw, before, after, file) {
 
     searchController = new AbortController();
     try {
+        const payload = {keyword: kw, context_before: before, context_after: after, file};
+        if (scope) payload.scope = scope;
+        if (resetAll) payload.reset_all = true;
+        if (finalAll) payload.final_all = true;
         const resp = await fetch('/search', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({keyword: kw, context_before: before, context_after: after, file}),
+            body: JSON.stringify(payload),
             signal: searchController.signal
         });
         if (!resp.ok) throw new Error('search failed');
@@ -687,29 +726,36 @@ function clearResult() {
         // 重置匹配数显示
         matches = 0;
         document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
+        // 记录已点击清空，用于导出按钮提示
+        clearedAfterSearch = true;
     } catch (e) {
         console.warn('clearResult error:', e);
     }
 }
 
 // === 导出结果 ===
-/**
- * 将结果导出为本地 .txt 文件（过滤取消提示行）
- */
 function exportResult() {
-    const content = document.getElementById('result').textContent
-                      .split('\n')
-                      .filter(line => !line.includes('Cancelled'))
-                      .join('\n');
-    if (!content.trim()) { alert('检索结果为空，无需导出！'); return; }
-    const kw = document.getElementById('keyword').value.trim().replace(/[^\w\u4e00-\u9fa5\-_ ]/g, '');
-    const fn = `${kw || 'search'}_${new Date().toISOString().slice(0,10)}_${Date.now()}.txt`;
-    const blob = new Blob([content], {type: 'text/plain'});
+    const kwRaw = document.getElementById('keyword').value || '';
+    const kw = kwRaw.trim().replace(/[^\w\u4e00-\u9fa5\-_ ]/g, '');
+    const fileSel = document.getElementById('file');
+    const fileVal = fileSel ? (fileSel.value || '') : '';
+
+    // 全文件模式：下载后端按时间戳命名的最新文件 <keyword>__all_<YYYY-MM-DD>_<ts>.txt
+    // 单文件模式：保持原路由参数以下载对应文件的最新导出
+    const url = '/download?keyword=' + encodeURIComponent(kw || 'search') +
+                '&file=' + encodeURIComponent(fileVal || '');
+
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = fn;
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener';
+    a.setAttribute('download', '');
     document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+
+    // 可选提示：如果用户之前点击过“清空”，提示当前导出的是后台文件
+    if (clearedAfterSearch) {
+        try { console.info('提示：已清空，导出的是后端文件。'); } catch (e) {}
+    }
 }
 
 window.addEventListener('beforeunload', () => {
