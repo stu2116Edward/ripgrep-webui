@@ -19,8 +19,14 @@
 
             <!-- 专属一行显示匹配数（居中、独占一行） -->
             <div id="matchDisplay" class="text-center">匹配：0 条</div>
-            <!-- 连接状态显示：放在匹配数下方 -->
-            <div id="connectStatus" class="text-center text-warning small">连接中</div>
+            <!-- 连接状态与预览开关：放在同一行，开关在右侧 -->
+            <div class="d-flex justify-content-center align-items-center small">
+                <div id="connectStatus" class="text-warning">连接中</div>
+                <div class="custom-control custom-switch ml-3">
+                    <input type="checkbox" class="custom-control-input" id="previewToggle">
+                    <label class="custom-control-label" for="previewToggle">预览</label>
+                </div>
+            </div>
 
             <!-- 检索控制区：关键词、上下文范围、文件选择与操作按钮 -->
             <form id="controls" class="mb-2 px-2 py-3 bg-white rounded shadow-sm">
