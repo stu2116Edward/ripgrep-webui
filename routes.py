@@ -87,8 +87,12 @@ def route_search():
     except Exception:
         after = 0
     file = (data.get('file') or '').strip()
+    scope = (data.get('scope') or '').strip()
+    scope = (scope if scope in ('all', 'single') else None)
+    reset_all = bool(data.get('reset_all') or False)
+    final_all = bool(data.get('final_all') or False)
 
-    status = start_search(keyword=keyword, context_before=before, context_after=after, file=file)
+    status = start_search(keyword=keyword, context_before=before, context_after=after, file=file, scope_override=scope, reset_all=reset_all, final_all=final_all)
 
     if status == "Started":
         try:
@@ -128,22 +132,33 @@ def route_hot_reload():
 @routes_bp.route('/download')
 def download():
     """
-    按关键字前缀下载最新导出结果：
-    - 参数：keyword
+    按关键字与检索模式下载最新导出结果：
+    - 参数：keyword（必填）、file（可选，用于区分单文件与全部文件：'__ALL__' 表示全部文件）
     """
     keyword = request.args.get('keyword')
     if not keyword:
         return "Missing keyword", 400
+    file_sel = (request.args.get('file') or '').strip()
+    scope = 'all' if (file_sel == '__ALL__') else 'single'
     safe = ''.join(c for c in keyword if c.isalnum() or c in (' ', '_', '-')).strip()
     if not safe:
         safe = 'search'
     exports_dir = get_exports_dir()
+    # 'all' 模式文件名已改为时间戳格式：<safe>__all_<YYYY-MM-DD>_<ts>.txt
+
     candidates = []
     try:
         if os.path.isdir(exports_dir):
+            # 兼容旧命名：带 scope 的文件名前缀 <safe>__<scope>_
+            prefix = f"{safe}__{scope}_"
             for fn in os.listdir(exports_dir):
-                if fn.startswith(safe):
+                if fn.startswith(prefix):
                     candidates.append(fn)
+            # 若未找到，回退到仅关键字前缀
+            if not candidates:
+                for fn in os.listdir(exports_dir):
+                    if fn.startswith(safe):
+                        candidates.append(fn)
     except Exception:
         candidates = []
     if not candidates:
