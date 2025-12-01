@@ -1168,6 +1168,52 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                 except Exception:
                     pass
 
+                # 主动排空内部队列，避免残留大对象占用内存
+                try:
+                    while not q.empty():
+                        try:
+                            q.get_nowait()
+                        except Exception:
+                            break
+                except Exception:
+                    pass
+
+                # 清理本地大对象引用，帮助垃圾回收尽快回收
+                try:
+                    try:
+                        forward_threads_local[:] = []
+                    except Exception:
+                        pass
+                    try:
+                        extra_procs_local[:] = []
+                    except Exception:
+                        pass
+                    try:
+                        owner_current_label.clear()
+                    except Exception:
+                        pass
+                    try:
+                        owner_has_output.clear()
+                    except Exception:
+                        pass
+                    try:
+                        search_start_ns.clear()
+                    except Exception:
+                        pass
+                    try:
+                        before_lines.clear()
+                        after_lines.clear()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+                # 触发垃圾回收，确保在“完成”消息前尽量释放内存
+                try:
+                    gc.collect()
+                except Exception:
+                    pass
+
                 try:
                     elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
                 except Exception:
