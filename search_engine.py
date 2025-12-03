@@ -17,7 +17,7 @@ import subprocess
 import tempfile
 import gc
 
-from config import DEFAULT_DATA_DIR, EXCEL_EXTS, CSV_EXTS, TEXT_EXTS
+from config import DEFAULT_DATA_DIR, EXCEL_EXTS, CSV_EXTS, TEXT_EXTS, RG_QUEUE_MAXSIZE
 from utils import (
     get_app, get_socketio, emit_message_utf, emit_progress_ex, has_cmd,
     sanitize_keyword, classify_file_type, strip_single_compress_ext, popen_creationflags,
@@ -36,6 +36,119 @@ import process_manager as pm
 # 缓存 ripgrep 是否支持 --label 参数（None 表示尚未检测）
 _RG_SUPPORTS_LABEL = None
 _RG_LOCK = threading.Lock()
+
+
+class RGSession:
+    def __init__(self, queue_maxsize):
+        self.q = queue.Queue(maxsize=queue_maxsize)
+        self.all_rg_procs = []
+        self.extra_procs_local = []
+        self.forward_threads_local = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self.close()
+        except Exception:
+            pass
+        return False
+
+    def register_rg_proc(self, p):
+        try:
+            self.all_rg_procs.append(p)
+        except Exception:
+            pass
+
+    def register_extra_proc(self, p):
+        try:
+            self.extra_procs_local.append(p)
+            pm.extra_procs.append(p)
+        except Exception:
+            pass
+        return getattr(p, 'pid', None)
+
+    def register_thread(self, t):
+        try:
+            self.forward_threads_local.append(t)
+        except Exception:
+            pass
+
+    def close(self, scope=None, keyword=None, final_all=False):
+        try:
+            for p in list(self.all_rg_procs):
+                try:
+                    if hasattr(p, 'poll') and p.poll() is None:
+                        pm._terminate_proc(p)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            for p in list(self.extra_procs_local):
+                try:
+                    if hasattr(p, 'poll') and p.poll() is None:
+                        pm._terminate_proc(p)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            for d in list(pm.temp_dirs):
+                try:
+                    shutil.rmtree(d)
+                except Exception:
+                    pass
+            pm.temp_dirs.clear()
+        except Exception:
+            pass
+        try:
+            pm._proc_label_map.clear()
+        except Exception:
+            pass
+        pm.proc = None
+        try:
+            if scope == 'single' or (scope == 'all' and final_all):
+                close_export_stream(sanitize_keyword(keyword))
+        except Exception:
+            pass
+        try:
+            pm.extra_procs.clear()
+        except Exception:
+            pass
+        try:
+            for t in list(self.forward_threads_local):
+                try:
+                    t.join(timeout=0.5)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            while not self.q.empty():
+                try:
+                    self.q.get_nowait()
+                except Exception:
+                    break
+        except Exception:
+            pass
+        try:
+            self.forward_threads_local[:] = []
+        except Exception:
+            pass
+        try:
+            self.extra_procs_local[:] = []
+        except Exception:
+            pass
+        try:
+            self.all_rg_procs[:] = []
+        except Exception:
+            pass
+        try:
+            gc.collect()
+        except Exception:
+            pass
 
 
 def check_rg_supports_label():
@@ -134,14 +247,14 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
     if include_glob_for_basename:
         rg_base += ['--glob', f'**/{include_glob_for_basename}']
 
-    # 启动并管理若干 rg 进程
-    all_rg_procs = []
-    extra_procs_local = []
-    forward_threads_local = []
+    # 启动并管理本次搜索会话资源
+    session = RGSession(RG_QUEUE_MAXSIZE)
+    q = session.q
+    total_files = 0
     total_files = 0
 
     try:
-        q = queue.Queue()
+        # 设定队列最大容量，对 rg 的海量输出施加背压，避免内存暴涨
 
         def forward_proc_stdout(p):
             pid = getattr(p, 'pid', id(p))
@@ -151,7 +264,19 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                 for raw in p.stdout:
                     if pm.cancel_requested:
                         break
-                    q.put((raw, pid))
+                    # 使用带超时的入队实现背压，避免队列满导致内存占用过高
+                    while True:
+                        if pm.cancel_requested:
+                            break
+                        try:
+                            q.put((raw, pid), timeout=0.1)
+                            break
+                        except queue.Full:
+                            # 队列暂满，短暂等待消费者处理
+                            try:
+                                time.sleep(0.01)
+                            except Exception:
+                                pass
             except Exception:
                 pass
             finally:
@@ -164,15 +289,25 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                             pass
                 except Exception:
                     pass
-                q.put((None, pid))
+                # 尝试发送结束标志，避免阻塞在队列满的情况
+                done_sent = False
+                for _ in range(10):
+                    try:
+                        q.put((None, pid), timeout=0.1)
+                        done_sent = True
+                        break
+                    except queue.Full:
+                        try:
+                            time.sleep(0.02)
+                        except Exception:
+                            pass
+                if not done_sent:
+                    # 如果队列持续满，放弃发送结束标志，主循环会通过进程状态判断结束
+                    pass
 
         def _register_proc(rp):
-            """统一注册进程到管理列表，返回 pid 或 None"""
             try:
-                all_rg_procs.append(rp)
-                extra_procs_local.append(rp)
-                pm.extra_procs.append(rp)
-                return getattr(rp, 'pid', None)
+                return session.register_rg_proc(rp)
             except Exception:
                 return None
 
@@ -222,7 +357,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
             try:
                 t = threading.Thread(target=forward_proc_stdout, args=(rg_proc,), daemon=True)
                 t.start()
-                forward_threads_local.append(t)
+                session.register_thread(t)
             except Exception:
                 pass
 
@@ -251,8 +386,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                             preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None,
                             creationflags=popen_creationflags()
                         )
-                        extra_procs_local.append(decompress_proc)
-                        pm.extra_procs.append(decompress_proc)
+                        session.register_extra_proc(decompress_proc)
                         if is_excel_file(inner_lower):
                             def feed_fn(w, proc=decompress_proc, name=inner_lower, lb=label):
                                 def _cb(done, total, elapsed_ms):
@@ -425,8 +559,9 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                     streamed_local = False
                     try:
                         import rarfile
-                        rf = rarfile.RarFile(search_path_local)
-                        members = rf.infolist()
+                        # 使用上下文管理器确保归档对象及时关闭，避免文件句柄泄漏
+                        with rarfile.RarFile(search_path_local) as rf:
+                            members = rf.infolist()
                         for mi in members:
                             if mi.isdir():
                                 continue
@@ -475,8 +610,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                             shell=False, preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None,
                                             creationflags=popen_creationflags()
                                         )
-                                        extra_procs_local.append(dec_proc)
-                                        pm.extra_procs.append(dec_proc)
+                                        session.register_extra_proc(dec_proc)
                                         lower = nm.lower()
                                         def _cb(done, total, elapsed_ms):
                                             emit_progress_ex(phase='decompress', file_type='archive',
@@ -523,8 +657,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                     preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None,
                                     creationflags=popen_creationflags()
                                 )
-                                extra_procs_local.append(extract_proc)
-                                pm.extra_procs.append(extract_proc)
+                                session.register_extra_proc(extract_proc)
                                 out, err = extract_proc.communicate()
                                 if extract_proc.returncode == 0:
                                     extracted_ok = True
@@ -562,8 +695,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                             shell=False, preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None,
                                             creationflags=popen_creationflags()
                                         )
-                                        extra_procs_local.append(dec_proc)
-                                        pm.extra_procs.append(dec_proc)
+                                        session.register_extra_proc(dec_proc)
                                         lower = nm.lower()
                                         def _cb(done, total, elapsed_ms):
                                             emit_progress_ex(phase='decompress', file_type='archive',
@@ -652,8 +784,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                     preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None,
                                     creationflags=popen_creationflags()
                                 )
-                                extra_procs_local.append(extract_proc)
-                                pm.extra_procs.append(extract_proc)
+                                session.register_extra_proc(extract_proc)
                                 out, err = extract_proc.communicate()
                                 if extract_proc.returncode == 0:
                                     extracted_ok = True
@@ -783,33 +914,25 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                     continue
 
         # 启动后续处理
-        total_procs = len(all_rg_procs)
+        total_procs = len(session.all_rg_procs)
         if total_procs == 0:
             try:
                 emit_message_utf('没有可搜索的文件或内容。\n')
             except Exception:
                 pass
             pm.proc = None
+            # 使用统一的会话清理逻辑
             try:
-                if scope == 'single' or (scope == 'all' and final_all):
-                    close_export_stream(sanitize_keyword(keyword))
-            except Exception:
-                pass
-            try:
-                pm.extra_procs.clear()
-            except Exception:
-                pass
-            try:
-                pm._proc_label_map.clear()
+                session.close(scope=scope, keyword=keyword, final_all=final_all)
             except Exception:
                 pass
             return "Started"
 
         # 标记主进程（用于 /cancel 检测）
         try:
-            pm.proc = all_rg_procs[0]
+            pm.proc = session.all_rg_procs[0]
         except Exception:
-            pm.proc = all_rg_procs[-1]
+            pm.proc = session.all_rg_procs[-1]
 
         request_start_ns = time.perf_counter_ns()
 
@@ -849,7 +972,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                             if pm.cancel_requested:
                                 break
                             all_ended = True
-                            for p in extra_procs_local:
+                            for p in session.extra_procs_local:
                                 if p.poll() is None:
                                     all_ended = False
                                     break
@@ -1121,73 +1244,11 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                         elapsed_ms_total = 0
                     emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
             finally:
-                # 最终清理：额外进程、临时目录、导出流、主进程标记
                 try:
-                    for p in extra_procs_local:
-                        try:
-                            if p.poll() is None:
-                                try:
-                                    pm._terminate_proc(p)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
+                    session.close(scope=scope, keyword=keyword, final_all=final_all)
                 except Exception:
                     pass
                 try:
-                    for d in list(pm.temp_dirs):
-                        try:
-                            shutil.rmtree(d)
-                        except Exception:
-                            pass
-                    pm.temp_dirs.clear()
-                except Exception:
-                    pass
-                try:
-                    pm._proc_label_map.clear()
-                except Exception:
-                    pass
-                pm.proc = None
-                try:
-                    if scope == 'single' or (scope == 'all' and final_all):
-                        close_export_stream(sanitize_keyword(keyword))
-                except Exception:
-                    pass
-                # 清理可能累积的全局附加进程引用
-                try:
-                    pm.extra_procs.clear()
-                except Exception:
-                    pass
-                # 等待前向读取线程结束
-                try:
-                    for t in forward_threads_local:
-                        try:
-                            t.join(timeout=0.5)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-                # 主动排空内部队列，避免残留大对象占用内存
-                try:
-                    while not q.empty():
-                        try:
-                            q.get_nowait()
-                        except Exception:
-                            break
-                except Exception:
-                    pass
-
-                # 清理本地大对象引用，帮助垃圾回收尽快回收
-                try:
-                    try:
-                        forward_threads_local[:] = []
-                    except Exception:
-                        pass
-                    try:
-                        extra_procs_local[:] = []
-                    except Exception:
-                        pass
                     try:
                         owner_current_label.clear()
                     except Exception:
@@ -1205,12 +1266,6 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                         after_lines.clear()
                     except Exception:
                         pass
-                except Exception:
-                    pass
-
-                # 触发垃圾回收，确保在“完成”消息前尽量释放内存
-                try:
-                    gc.collect()
                 except Exception:
                     pass
 
@@ -1252,42 +1307,9 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                     get_socketio().emit('message', {'message': f'Start failed: {e}\n'})
             except Exception:
                 pass
-            # 清理
-            for p in extra_procs_local:
-                try:
-                    pm._terminate_proc(p)
-                except Exception:
-                    pass
-            for d in pm.temp_dirs:
-                try:
-                    shutil.rmtree(d)
-                except Exception:
-                    pass
+            # 统一清理
             try:
-                pm.temp_dirs.clear()
-            except Exception:
-                pass
-            try:
-                pm._proc_label_map.clear()
-            except Exception:
-                pass
-            try:
-                for t in forward_threads_local:
-                    try:
-                        t.join(timeout=0.5)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            extra_procs_local = []
-            pm.proc = None
-            try:
-                pm.extra_procs.clear()
-            except Exception:
-                pass
-            try:
-                if scope == 'single' or (scope == 'all' and final_all):
-                    close_export_stream(sanitize_keyword(keyword))
+                session.close(scope=scope, keyword=keyword, final_all=final_all)
             except Exception:
                 pass
             return "Error"
@@ -1300,7 +1322,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                 get_socketio().emit('message', {'message': f'Start failed: {e}\n'})
         except Exception:
             pass
-        for p in extra_procs_local:
+        for p in session.extra_procs_local:
             try:
                 pm._terminate_proc(p)
             except Exception:
@@ -1310,31 +1332,9 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                 shutil.rmtree(d)
             except Exception:
                 pass
+        # 统一通过会话关闭来清理
         try:
-            pm.temp_dirs.clear()
-        except Exception:
-            pass
-        try:
-            pm._proc_label_map.clear()
-        except Exception:
-            pass
-        try:
-            for t in forward_threads_local:
-                try:
-                    t.join(timeout=0.5)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        extra_procs_local = []
-        pm.proc = None
-        try:
-            pm.extra_procs.clear()
-        except Exception:
-            pass
-        try:
-            if scope == 'single' or (scope == 'all' and final_all):
-                close_export_stream(sanitize_keyword(keyword))
+            session.close(scope=scope, keyword=keyword, final_all=final_all)
         except Exception:
             pass
         return "Error"
