@@ -54,7 +54,7 @@ COPY export_manager.py .
 COPY templates/ ./templates/
 
 # 设置环境变量
-ENV GUNICORN_CMD_ARGS="-w 1 -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker --preload --max-requests 0 --timeout 0 --graceful-timeout 0 --keep-alive 30"
+ENV GUNICORN_CMD_ARGS="-w 1 -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker --max-requests 1000 --max-requests-jitter 100 --timeout 30 --graceful-timeout 30"
 ENV PYTHONUNBUFFERED="TRUE"
 
 # 验证安装
