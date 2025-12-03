@@ -10,6 +10,7 @@ import time
 import queue
 import threading
 import gc
+from config import EXPORT_QUEUE_MAXSIZE, EXPORT_FLUSH_INTERVAL_MS
 
 # 后台导出文件的流式写入句柄（按安全化后的关键字区分）
 export_streams = {}
@@ -79,10 +80,15 @@ def start_export_stream(safe_kw: str, scope: str = 'single'):
             filename = f"{safe_kw}__single_{today}_{ts}.txt"
         filepath = os.path.join(exports_dir, filename)
         # all 采用追加模式，single 采用覆盖模式
-        fh = open(filepath, 'w', encoding='utf-8')
-        q = queue.Queue()
+        fh_mode = 'a' if scope == 'all' else 'w'
+        # 提升写盘缓冲，降低系统调用频率
+        fh = open(filepath, fh_mode, encoding='utf-8', buffering=1024 * 1024)
+        # 对导出写入队列设定最大容量，避免高峰期内存暴涨
+        q = queue.Queue(maxsize=EXPORT_QUEUE_MAXSIZE)
 
         def _writer_loop():
+            last_flush_ns = time.perf_counter_ns()
+            flush_interval_ns = (EXPORT_FLUSH_INTERVAL_MS or 200) * 1_000_000
             try:
                 while True:
                     item = q.get()
@@ -96,14 +102,19 @@ def start_export_stream(safe_kw: str, scope: str = 'single'):
                     try:
                         sanitized = item.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
                         fh.write(sanitized)
+                        # 周期性 flush，降低频繁 flush 带来的 I/O 压力
                         try:
-                            fh.flush()
+                            now_ns = time.perf_counter_ns()
+                            if (now_ns - last_flush_ns) >= flush_interval_ns:
+                                fh.flush()
+                                last_flush_ns = now_ns
                         except Exception:
                             pass
                     except Exception:
                         pass
             finally:
                 try:
+                    # 结束前确保完全 flush
                     fh.flush()
                 except Exception:
                     pass
@@ -132,7 +143,17 @@ def append_export_text(safe_kw: str, text: str, scope: str = None):
         q = info and info.get('queue')
         if not q:
             return
-        q.put(text)
+        # 队列可能在高峰期满载，使用带超时阻塞的写入以形成背压
+        while True:
+            try:
+                q.put(text, timeout=0.5)
+                break
+            except queue.Full:
+                # 轻微等待后重试，避免忙等
+                try:
+                    time.sleep(0.05)
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -145,36 +166,32 @@ def close_export_stream(safe_kw: str):
             return
         q = info.get('queue')
         t = info.get('thread')
-        # 在发送终止标志之前尽量清空队列，避免大文本在内存中排队等待写盘
         try:
             if q:
-                try:
-                    # 优先使用内部队列快速清空（带锁，尽量安全）
-                    if hasattr(q, 'mutex') and hasattr(q, 'queue'):
-                        with q.mutex:
-                            try:
-                                q.queue.clear()
-                            except Exception:
-                                # 兜底：逐条非阻塞清空
-                                pass
-                    # 兜底再次尝试逐条非阻塞清理
-                    while True:
+                # 在队列可能满载时，分次尝试投递终止标志，避免长时间阻塞
+                sent = False
+                for _ in range(100):
+                    try:
+                        q.put(None, timeout=0.2)
+                        sent = True
+                        break
+                    except queue.Full:
                         try:
-                            q.get_nowait()
+                            time.sleep(0.02)
                         except Exception:
-                            break
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            if q:
-                q.put(None)
+                            pass
+                if not sent:
+                    # 若仍未成功，最后再做一次无超时投递（通常已可投递）
+                    try:
+                        q.put(None)
+                    except Exception:
+                        pass
         except Exception:
             pass
         try:
             if t:
-                t.join(timeout=1.0)
+                # 等待写入线程尽可能完成队列中剩余数据的落盘
+                t.join(timeout=2.0)
         except Exception:
             pass
         fh = info.get('fh')
