@@ -23,7 +23,13 @@ docker run -d \
   -p 5757:5000 \
   -v /data/kuzi:/data:ro \
   -v $(pwd)/exports:/app/exports \
-  --restart always \
+  --restart unless-stopped \
+  --cpus=1.0 \
+  --cpuset-cpus="0" \
+  --cpu-shares=1024 \
+  --memory="2g" \
+  --memory-reservation="512m" \
+  --memory-swap="4g" \
   stu2116edwardhu/ripgrep-webui
 ```
 - 使用docker-compose部署
@@ -31,6 +37,13 @@ docker run -d \
 ```yml
 services:
   ripgrep-webui:
+    cpu_count: 1                  # CPU核心数
+    cpuset: '0'                   # 绑定到特定CPU
+    cpu_shares: 1024              # CPU相对权重（默认1024）
+    cpus: 1.0                     # CPU限制（docker-compose v2.3+）
+    mem_limit: 2g                 # 内存硬限制
+    mem_reservation: 512m         # 内存软限制
+    memswap_limit: 4g             # 内存+交换空间总限制
     image: stu2116edwardhu/ripgrep-webui
     container_name: ripgrep-webui
     ports:
@@ -38,7 +51,7 @@ services:
     volumes:
       - /data/kuzi:/data:ro
       - ./exports:/app/exports
-    restart: always
+    restart: unless-stopped
 ```
 将`/data/kuzi`替换为你存放文件的路径  
 `./exports`是存放历史查询的目录
