@@ -8,13 +8,35 @@ RUN apk add --no-cache --virtual .build-deps \
     gcc \
     musl-dev \
     linux-headers \
-    binutils
+    binutils \
+    curl \
+    tar
 
 # 复制 requirements.txt
 COPY requirements.txt .
 
 # 安装Python包（禁用字节码编译以减小体积）
 RUN pip install --user --no-cache-dir --no-compile -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 获取最新 ripgrep rg（根据构建平台选择 musl 版本），仅在构建阶段执行
+ARG TARGETPLATFORM
+RUN set -eux; \
+    case "$TARGETPLATFORM" in \
+      "linux/amd64") RG_ARCH="x86_64-unknown-linux-musl" ;; \
+      "linux/arm64") RG_ARCH="aarch64-unknown-linux-musl" ;; \
+      *) echo "Unsupported TARGETPLATFORM: $TARGETPLATFORM"; exit 1 ;; \
+    esac; \
+    RG_URL=$(curl -s https://api.github.com/repos/BurntSushi/ripgrep/releases/latest \
+      | grep browser_download_url \
+      | grep "${RG_ARCH}\.tar\.gz" \
+      | head -n1 \
+      | cut -d '"' -f 4); \
+    curl -L "$RG_URL" -o /tmp/rg.tar.gz; \
+    mkdir -p /tmp/rgdl; \
+    tar -xzf /tmp/rg.tar.gz -C /tmp/rgdl; \
+    mv /tmp/rgdl/ripgrep-*/rg /usr/local/bin/rg; \
+    chmod +x /usr/local/bin/rg; \
+    rg --version
 
 # 清理Python非必要内容并优化二进制体积
 RUN find /root/.local/lib/python3.9/site-packages -type d -name '__pycache__' -exec rm -rf {} + && \
@@ -39,18 +61,15 @@ RUN apk add --no-cache \
 # 从构建阶段仅复制必要的Python运行内容
 COPY --from=builder /root/.local/lib/python3.9/site-packages /root/.local/lib/python3.9/site-packages
 COPY --from=builder /root/.local/bin /root/.local/bin
+COPY --from=builder /usr/local/bin/rg /usr/bin/rg
 
 # 确保Python可以找到用户安装的包
-ENV PYTHONPATH=/root/.local/lib/python3.9/site-packages:/root/.local/lib/python3.9/site-packages
+ENV PYTHONPATH=/root/.local/lib/python3.9/site-packages
 ENV PATH=/root/.local/bin:$PATH
 ENV PYTHONDONTWRITEBYTECODE=1
 
 # 创建必要的目录结构
 RUN mkdir -p templates exports
-
-# 复制 ripgrep 二进制文件
-COPY rg /usr/bin/rg
-RUN chmod +x /usr/bin/rg
 
 # 复制应用代码
 COPY main.py .
