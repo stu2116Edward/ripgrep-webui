@@ -33,3 +33,17 @@ CSV_EXTS = (".csv",)
 TEXT_EXTS = (
     ".txt", ".log", ".json", ".xml", ".md", ".ini", ".yaml", ".yml"
 )
+
+# 可配置的队列与写盘参数（用于控制内存与吞吐）
+# rg 输出队列最大项数（施加背压，避免内存膨胀）
+SEARCH_RG_QUEUE_MAXSIZE = 16384
+# 导出写入队列最大项数（施加背压）
+EXPORT_WRITE_QUEUE_MAXSIZE = 4096
+# 导出文件缓冲区大小（字节，越大写盘吞吐越高）
+EXPORT_WRITE_BUFFER_SIZE = 1024 * 1024  # 1MB
+# 写入线程批量写入的最大项数（减少频繁系统调用）
+EXPORT_WRITER_BATCH_MAX_ITEMS = 256
+# 写入线程批量写入的目标字符数（近似控制批大小）
+EXPORT_WRITER_BATCH_MAX_BYTES = 128 * 1024  # 128KB（按字符近似）
+# 周期性刷新间隔（毫秒，0 表示仅在关闭时刷新）
+EXPORT_WRITER_FLUSH_INTERVAL_MS = 0
