@@ -17,7 +17,7 @@ import subprocess
 import tempfile
 import gc
 
-from config import DEFAULT_DATA_DIR, EXCEL_EXTS, CSV_EXTS, TEXT_EXTS
+from config import DEFAULT_DATA_DIR, EXCEL_EXTS, CSV_EXTS, TEXT_EXTS, SEARCH_RG_QUEUE_MAXSIZE
 from utils import (
     get_app, get_socketio, emit_message_utf, emit_progress_ex, has_cmd,
     sanitize_keyword, classify_file_type, strip_single_compress_ext, popen_creationflags,
@@ -141,8 +141,8 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
     total_files = 0
 
     try:
-        # 使用有界队列限制rg输出缓冲，施加背压避免内存增长
-        q = queue.Queue(maxsize=16384)
+        # 使用有界队列限制rg输出缓冲，施加背压避免内存增长（从配置读取）
+        q = queue.Queue(maxsize=SEARCH_RG_QUEUE_MAXSIZE)
 
         def forward_proc_stdout(p):
             pid = getattr(p, 'pid', id(p))
