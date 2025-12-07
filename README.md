@@ -74,7 +74,7 @@ python main.py
 
 
 ### 界面展示
-<img width="1196" height="695" alt="屏幕截图 2025-10-19 211813" src="https://github.com/user-attachments/assets/bfa8f45b-e9ad-4f94-ace8-62b8d8ff879b" />
+<img width="1223" height="712" alt="屏幕截图 2025-12-07 212649" src="https://github.com/user-attachments/assets/fe56e185-7498-471f-b910-d91c2e894b78" />
 
 ### 自行编译
 可以自行替换ripgrep的版本去[ripgrep-release](https://github.com/BurntSushi/ripgrep/releases)下载你系统版本的二进制，比如你是`x86_64_linux`，  
