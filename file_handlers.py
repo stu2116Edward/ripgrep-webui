@@ -42,9 +42,8 @@ def try_rarfile_extract(archive_path, dest):
     except Exception:
         return False, "rarfile not available"
     try:
-        # 使用上下文管理器确保资源在异常或正常结束时都能正确关闭
-        with rarfile.RarFile(archive_path) as rf:
-            rf.extractall(dest)
+        rf = rarfile.RarFile(archive_path)
+        rf.extractall(dest)
         return True, ""
     except Exception as e:
         return False, str(e)
