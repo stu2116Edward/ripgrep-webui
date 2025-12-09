@@ -8,6 +8,8 @@
 import os
 import shutil
 from functools import lru_cache
+import gc
+import ctypes
 
 from config import (
     STREAM_CHUNK_SIZE,
@@ -166,3 +168,40 @@ def strip_single_compress_ext(filename_lower: str) -> str:
             inner_ext = os.path.splitext(base)[1].lower()
             return inner_ext
     return ''
+
+
+def trim_process_memory():
+    """
+    主动尝试将进程内存归还给操作系统：
+    - 始终先运行一次 gc.collect()
+    - Windows: 调用 psapi.EmptyWorkingSet 将工作集尽量压缩
+    - Linux: 尝试 libc.malloc_trim(0) 释放未使用的堆内存
+    其他平台若不可用则静默跳过。
+    """
+    try:
+        # 先进行 Python 层垃圾回收
+        try:
+            gc.collect()
+        except Exception:
+            pass
+
+        if os.name == 'nt':
+            try:
+                # 压缩当前进程工作集，降低常驻内存占用
+                hproc = ctypes.windll.kernel32.GetCurrentProcess()
+                ctypes.windll.psapi.EmptyWorkingSet(hproc)
+            except Exception:
+                pass
+        else:
+            try:
+                # 通过 libc 的 malloc_trim 归还未使用的堆内存（GLIBC）
+                libc = ctypes.CDLL('libc.so.6')
+                try:
+                    libc.malloc_trim(0)
+                except Exception:
+                    pass
+            except Exception:
+                # 非 GLIBC 或不可用时跳过
+                pass
+    except Exception:
+        pass
