@@ -66,7 +66,9 @@ def _on_disconnect():
         pass
 
     try:
-        trigger_hot_reload_async()
+        enable = os.environ.get('HOT_RELOAD_ON_DISCONNECT', '')
+        if str(enable).strip().lower() in ('1', 'true', 'yes', 'y', 'on'):
+            trigger_hot_reload_async()
     except Exception:
         pass
 
