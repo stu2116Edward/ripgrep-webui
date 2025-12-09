@@ -12,7 +12,7 @@ from flask import (
 )
 
 from config import DEFAULT_DATA_DIR
-from utils import emit_message_utf
+from utils import emit_message_utf, sanitize_keyword
 from search_engine import start_search
 from process_manager import cancel as cancel_search
 from process_manager import trigger_hot_reload_async
@@ -134,15 +134,14 @@ def download():
     """
     按关键字与检索模式下载最新导出结果：
     - 参数：keyword（必填）、file（可选，用于区分单文件与全部文件：'__ALL__' 表示全部文件）
+    - 可选：stamp（形如 MM-DD_ts），用于定位特定导出文件；不传则选择最新
     """
     keyword = request.args.get('keyword')
     if not keyword:
         return "Missing keyword", 400
     file_sel = (request.args.get('file') or '').strip()
     scope = 'all' if (file_sel == '__ALL__') else 'single'
-    safe = ''.join(c for c in keyword if c.isalnum() or c in (' ', '_', '-')).strip()
-    if not safe:
-        safe = 'search'
+    safe = sanitize_keyword(keyword)
     exports_dir = get_exports_dir()
     # 'all' 模式文件名已改为时间戳格式：<safe>__all_<YYYY-MM-DD>_<ts>.txt
 
@@ -163,5 +162,92 @@ def download():
         candidates = []
     if not candidates:
         abort(404)
+
+    # 如果提供了 stamp=MM-DD_ts，尝试精确匹配该文件
+    stamp = (request.args.get('stamp') or '').strip()
+    def _stamp_of(fn: str) -> str:
+        try:
+            prefix = f"{safe}__{scope}_"
+            if not fn.startswith(prefix):
+                return ''
+            rest = fn[len(prefix):]  # YYYY-MM-DD_<ts>.txt
+            parts = rest.split('_')
+            if len(parts) < 2:
+                return ''
+            date = parts[0]  # YYYY-MM-DD
+            ts_part = parts[1]
+            ts = ts_part.split('.')[0]
+            mmdd = date[5:] if len(date) >= 10 else ''
+            return f"{mmdd}_{ts}" if mmdd and ts else ''
+        except Exception:
+            return ''
+
+    chosen = None
+    if stamp and len(stamp) >= 8:
+        # 基于传入的 MM-DD_ts 精确定位
+        for fn in candidates:
+            try:
+                if _stamp_of(fn) == stamp:
+                    chosen = fn
+                    break
+            except Exception:
+                pass
+    if not chosen:
+        # 未指定或未匹配到，选择最新
+        candidates.sort(key=lambda n: os.path.getmtime(os.path.join(exports_dir, n)), reverse=True)
+        chosen = candidates[0]
+    return send_from_directory(exports_dir, chosen, as_attachment=True)
+
+
+@routes_bp.route('/export-info')
+def export_info():
+    """
+    返回某关键字与模式下最新导出文件的信息（用于构造下载链接）
+    - 参数：keyword（必填）、file（可选，'__ALL__' 表示全部文件）
+    返回：{"filename": str, "stamp": "MM-DD_ts", "download_url": str}
+    """
+    keyword = request.args.get('keyword')
+    if not keyword:
+        return "Missing keyword", 400
+    file_sel = (request.args.get('file') or '').strip()
+    scope = 'all' if (file_sel == '__ALL__') else 'single'
+    safe = sanitize_keyword(keyword)
+    exports_dir = get_exports_dir()
+
+    candidates = []
+    try:
+        if os.path.isdir(exports_dir):
+            prefix = f"{safe}__{scope}_"
+            for fn in os.listdir(exports_dir):
+                if fn.startswith(prefix):
+                    candidates.append(fn)
+    except Exception:
+        candidates = []
+    if not candidates:
+        return jsonify({"exists": False}), 404
     candidates.sort(key=lambda n: os.path.getmtime(os.path.join(exports_dir, n)), reverse=True)
-    return send_from_directory(exports_dir, candidates[0], as_attachment=True)
+    latest = candidates[0]
+
+    # 提取 MM-DD_ts
+    def _stamp_of(fn: str) -> str:
+        try:
+            prefix = f"{safe}__{scope}_"
+            rest = fn[len(prefix):]
+            parts = rest.split('_')
+            if len(parts) < 2:
+                return ''
+            date = parts[0]
+            ts_part = parts[1]
+            ts = ts_part.split('.')[0]
+            mmdd = date[5:] if len(date) >= 10 else ''
+            return f"{mmdd}_{ts}" if mmdd and ts else ''
+        except Exception:
+            return ''
+    stamp = _stamp_of(latest)
+    dl_url = f"/download?keyword={safe}&file={'__ALL__' if scope=='all' else ''}&stamp={stamp}" if stamp else f"/download?keyword={safe}&file={'__ALL__' if scope=='all' else ''}"
+    return jsonify({
+        "exists": True,
+        "filename": latest,
+        "stamp": stamp,
+        "download_url": dl_url
+    })
