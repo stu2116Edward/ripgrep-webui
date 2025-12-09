@@ -507,10 +507,8 @@ window.addEventListener('DOMContentLoaded', function(){
     // 初始化预览开关（设置在刷新后生效）
     try { setupPreviewToggle(); } catch (e) {}
 
-    // 触发容器内进程热重载：每次页面打开或刷新时调用
     try {
         setConnectionStatus('连接中');
-        trackedFetch('/hot-reload', { method: 'POST' }, true).catch(() => {});
     } catch (e) {}
 
     // 初次加载文件列表，同时在连接恢复时也会自动刷新
@@ -641,12 +639,12 @@ socket.on('message', data => {
         document.getElementById('submitBtn').disabled = false;
         clearTimeout(progressHideTimeout);
         progressHideTimeout = setTimeout(() => hideProgress(), 1200);
-        // 若开启预览，保留已展示内容，仅进行压缩以降低占用；
-        // 若关闭预览，则进行彻底重置以回收前端内存。
-        if (previewEnabled) {
-            try { aggressiveCompactResult(); } catch (e) {}
-        } else {
+        // 在检索完成后统一执行硬重置归还内存（参考取消逻辑）
+        try {
             hardResetResults('done');
+        } catch (e) {
+            // 兜底：回退到轻量压缩
+            try { aggressiveCompactResult(); } catch (_) {}
         }
         return;
     }
@@ -728,16 +726,13 @@ socket.on('progress', data => {
         document.getElementById('submitBtn').disabled = false;
         clearTimeout(progressHideTimeout);
         progressHideTimeout = setTimeout(() => hideProgress(), 1200);
-        // 每个文件完成时按“取消”逻辑归还内存：在多文件模式下更彻底清理
+        // 每个文件完成后统一执行硬重置归还内存（参考取消逻辑）
         try {
             const isSearchAll = (document.getElementById('file').value === '__ALL__');
-            if (isSearchAll && reachedSearchEnd) {
-                hardResetResults('file_end');
-            } else {
-                aggressiveCompactResult();
-            }
+            const tag = isSearchAll ? 'file_end' : 'single_end';
+            hardResetResults(tag);
         } catch (e) {
-            // 回退到轻量压缩
+            // 兜底：回退到轻量压缩
             try { aggressiveCompactResult(); } catch (_) {}
         }
         return;
@@ -992,7 +987,7 @@ function clearResult() {
     }
 }
 
-// 页面关闭/隐藏时：立即触发取消与热重载，确保后端立刻重启与归还内存
+// 页面关闭时：立即触发取消与热重载；页面隐藏仅做前端清理
 function sendCloseBeacons() {
     try {
         if (navigator.sendBeacon) {
@@ -1012,7 +1007,7 @@ window.addEventListener('beforeunload', () => {
 });
 
 window.addEventListener('pagehide', () => {
-    // 某些浏览器在 beforeunload 不可靠时触发 pagehide，双保险
+    // 页面隐藏时不触发后端热重载，仅进行本地清理
     try { cancelSearch(); } catch (e) {}
-    sendCloseBeacons();
+    // 不发送信标，避免隐藏/后台时触发热重载
 });
