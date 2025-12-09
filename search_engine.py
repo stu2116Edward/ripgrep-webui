@@ -21,7 +21,8 @@ from config import DEFAULT_DATA_DIR, EXCEL_EXTS, CSV_EXTS, TEXT_EXTS, SEARCH_RG_
 from utils import (
     get_app, get_socketio, emit_message_utf, emit_progress_ex, has_cmd,
     sanitize_keyword, classify_file_type, strip_single_compress_ext, popen_creationflags,
-    is_single_file_compressed, is_archive_multi_file, is_excel_file, is_csv_file
+    is_single_file_compressed, is_archive_multi_file, is_excel_file, is_csv_file,
+    trim_process_memory
 )
 from export_manager import start_export_stream, append_export_text, close_export_stream
 from file_handlers import (
@@ -65,8 +66,12 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
             pass
         return "Busy"
 
-    # 在开始新搜索时重置取消标志
+    # 在开始新搜索时重置取消标志，并进行一次轻量内存修剪
     pm.cancel_requested = False
+    try:
+        trim_process_memory()
+    except Exception:
+        pass
 
     data_dir = DEFAULT_DATA_DIR
     if not os.path.isdir(data_dir):
@@ -230,6 +235,44 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
             _register_proc(rg_proc)
             return rg_proc
 
+        def schedule_temp_dir_cleanup_for_proc(proc, temp_dir):
+            def _cleanup(p=proc, d=temp_dir):
+                try:
+                    if hasattr(p, 'wait'):
+                        p.wait()
+                except Exception:
+                    pass
+                try:
+                    shutil.rmtree(d)
+                except Exception:
+                    pass
+                try:
+                    if d in pm.temp_dirs:
+                        pm.temp_dirs.remove(d)
+                except Exception:
+                    pass
+                try:
+                    gc.collect()
+                except Exception:
+                    pass
+            try:
+                t = threading.Thread(target=_cleanup, daemon=True)
+                t.start()
+            except Exception:
+                try:
+                    if proc and getattr(proc, 'poll', lambda: None)() is not None:
+                        try:
+                            shutil.rmtree(temp_dir)
+                        except Exception:
+                            pass
+                        try:
+                            if temp_dir in pm.temp_dirs:
+                                pm.temp_dirs.remove(temp_dir)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
         # Helper: 处理单个文件（包括压缩/归档/Excel）
         def handle_single_file(search_path_local, basename_label=None):
             nonlocal total_files
@@ -355,7 +398,8 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                             for _ in fns:
                                 cnt += 1
                         total_files += cnt if cnt > 0 else 1
-                        start_rg_for_path(temp_dir_for_archive)
+                        _p = start_rg_for_path(temp_dir_for_archive)
+                        schedule_temp_dir_cleanup_for_proc(_p, temp_dir_for_archive)
                     except Exception:
                         try:
                             shutil.rmtree(temp_dir_for_archive)
@@ -414,7 +458,8 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                 for _ in fns:
                                     cnt += 1
                             total_files += cnt if cnt > 0 else 1
-                            start_rg_for_path(temp_dir_for_archive)
+                            _p = start_rg_for_path(temp_dir_for_archive)
+                            schedule_temp_dir_cleanup_for_proc(_p, temp_dir_for_archive)
                         except Exception:
                             try:
                                 shutil.rmtree(temp_dir_for_archive)
@@ -538,7 +583,8 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                 for _ in fns:
                                     cnt += 1
                             total_files += cnt if cnt > 0 else 1
-                            start_rg_for_path(temp_dir_for_archive)
+                            _p = start_rg_for_path(temp_dir_for_archive)
+                            schedule_temp_dir_cleanup_for_proc(_p, temp_dir_for_archive)
                         else:
                             try:
                                 shutil.rmtree(temp_dir_for_archive)
@@ -607,10 +653,16 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                         import py7zr as _py7zr
                                         try:
                                             with _py7zr.SevenZipFile(p, mode='r') as z2:
+                                                # 取消后直接返回，避免完整读取成员导致内存占用
+                                                if pm.cancel_requested:
+                                                    return
                                                 try:
                                                     data = z2.read([nm]).get(nm)
                                                 except Exception:
                                                     data = None
+                                                # 二次检查：读取完成后若已取消则不继续写入
+                                                if pm.cancel_requested:
+                                                    return
                                                 if data is None:
                                                     return
                                                 lower = nm.lower()
@@ -667,7 +719,8 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                 for _ in fns:
                                     cnt += 1
                             total_files += cnt if cnt > 0 else 1
-                            start_rg_for_path(temp_dir_for_archive)
+                            _p = start_rg_for_path(temp_dir_for_archive)
+                            schedule_temp_dir_cleanup_for_proc(_p, temp_dir_for_archive)
                         else:
                             try:
                                 shutil.rmtree(temp_dir_for_archive)
@@ -1023,7 +1076,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                 block_match_count = 1
                                 after_lines = []
 
-                        elif typ == 'end':
+                        if typ == 'end':
                             # 结束当前文件：完成 after 缓冲并统计
                             if block_ready:
                                 try:
@@ -1082,7 +1135,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                             except Exception:
                                 pass
 
-                            # 每个文件检索完成后主动回收局部状态与触发垃圾回收，降低长跑内存占用
+                            # 每个文件检索完成后主动回收局部状态并进行内存修剪，降低长跑内存占用
                             try:
                                 # 清理与该 owner 相关的临时映射，避免集合无限增长
                                 try:
@@ -1107,9 +1160,13 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                     after_emit_count = 0
                                 except Exception:
                                     pass
-                                # 触发一次垃圾回收（轻量，确保大型对象尽快回收）
+                                # 触发一次垃圾回收与进程内存修剪（轻量，确保大型对象尽快回收并释放工作集）
                                 try:
                                     gc.collect()
+                                except Exception:
+                                    pass
+                                try:
+                                    trim_process_memory()
                                 except Exception:
                                     pass
                             except Exception:
@@ -1209,9 +1266,13 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                 except Exception:
                     pass
 
-                # 触发垃圾回收，确保在“完成”消息前尽量释放内存
+                # 触发垃圾回收与进程内存修剪，确保在“完成”消息前尽量释放内存
                 try:
                     gc.collect()
+                except Exception:
+                    pass
+                try:
+                    trim_process_memory()
                 except Exception:
                     pass
 
