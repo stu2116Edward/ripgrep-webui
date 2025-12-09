@@ -253,6 +253,8 @@ def stream_excel_to_writer(path, out_stream):
                 except Exception:
                     pass
                 for row in sheet.iter_rows(values_only=True):
+                    if pm.cancel_requested:
+                        break
                     try:
                         vals = []
                         for v in row:
@@ -289,6 +291,8 @@ def stream_excel_to_writer(path, out_stream):
                 except Exception:
                     pass
                 for r in range(sheet.nrows):
+                    if pm.cancel_requested:
+                        break
                     try:
                         row = sheet.row_values(r)
                         vals = [(str(c) if c is not None else '') for c in row]
@@ -344,6 +348,8 @@ def stream_excel_bytes_to_writer(name_lower, data_bytes, out_stream):
             import xlrd
             wb = xlrd.open_workbook(file_contents=data_bytes, on_demand=True)
             for si in range(wb.nsheets):
+                if pm.cancel_requested:
+                    break
                 sheet = wb.sheet_by_index(si)
                 try:
                     out_stream.write((f"# sheet: {sheet.name}\n").encode('utf-8'))
@@ -496,6 +502,9 @@ def spool_stream_to_temp_then_stream_excel(name_lower: str, in_stream, out_strea
             tmp.close()
         except Exception:
             pass
+        # 若已取消，直接返回以避免继续解析 Excel（减少内存占用）
+        if pm.cancel_requested:
+            return
         # 直接复用现有的按路径Excel流式转换
         stream_excel_to_writer(tmp_path, out_stream)
     finally:
