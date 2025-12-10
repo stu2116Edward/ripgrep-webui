@@ -527,6 +527,8 @@ window.addEventListener('DOMContentLoaded', function(){
 
 // === 导出链接（纯后端下载） ===
 function updateExportLink() {
+    // 检索进行中不更新下载链接，避免拿到旧文件
+    if (running || pendingSubmit) return;
     const kwRaw = document.getElementById('keyword') ? (document.getElementById('keyword').value || '') : '';
     const kw = (kwRaw || '').trim().replace(/[^\\w\u4e00-\u9fa5\-_ ]/g, '');
     const fileSel = document.getElementById('file');
@@ -553,20 +555,7 @@ function updateExportLink() {
 }
 
 function setupExportLink() {
-    try {
-        const kwEl = document.getElementById('keyword');
-        const fileEl = document.getElementById('file');
-        if (kwEl) {
-            kwEl.addEventListener('input', function(){
-                updateExportLink();
-            });
-        }
-        if (fileEl) {
-            fileEl.addEventListener('change', function(){
-                updateExportLink();
-            });
-        }
-    } catch (e) {}
+    // 仅在取消或检索完成后由事件驱动更新，不绑定输入实时更新
 }
 
 // === Socket 消息处理 ===
@@ -598,6 +587,8 @@ socket.on('message', data => {
         progressHideTimeout = setTimeout(() => hideProgress(), 1200);
         // 取消后执行硬重置，确保结果区内存彻底释放
         hardResetResults('cancelled');
+        // 取消完成后刷新导出链接，确保指向最新文件
+        try { updateExportLink(); } catch (e) {}
         return;
     }
 
@@ -646,6 +637,8 @@ socket.on('message', data => {
             // 兜底：回退到轻量压缩
             try { aggressiveCompactResult(); } catch (_) {}
         }
+        // 检索完成后刷新导出链接，确保指向最新文件
+        try { updateExportLink(); } catch (e) {}
         return;
     }
 
@@ -735,6 +728,13 @@ socket.on('progress', data => {
             // 兜底：回退到轻量压缩
             try { aggressiveCompactResult(); } catch (_) {}
         }
+        // 仅在单文件完成或整个检索完成时更新导出链接
+        try {
+            const isSearchAll = (document.getElementById('file').value === '__ALL__');
+            if (reachedSearchEnd || !isSearchAll) {
+                updateExportLink();
+            }
+        } catch (e) {}
         return;
     }
     const now = Date.now();
@@ -808,6 +808,8 @@ async function sendKeyword() {
                 });
             }
         }
+        // 全量检索全部文件完成后刷新导出链接，确保匹配到最新文件
+        try { if (!wasCancelled) updateExportLink(); } catch (e) {}
         pendingSubmit = false;
         return;
     }
