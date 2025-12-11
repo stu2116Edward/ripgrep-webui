@@ -6,8 +6,15 @@ var socket = io({
     // 更稳健的重连与超时设置
     reconnection: true,
     reconnectionAttempts: 10,
-    timeout: 20000
+    timeout: 20000,
+    reconnectionDelay: 500,
+    reconnectionDelayMax: 2000,
+    randomizationFactor: 0.2
 });
+
+// 连接状态辅助标记与轮询（默认认为正在尝试连接）
+let isReconnecting = true;
+let statusInterval = null;
 
 // 连接状态更新函数（含颜色映射与文案规范化）
 function setConnectionStatus(text) {
@@ -35,12 +42,16 @@ function setConnectionStatus(text) {
     }
 }
 
-// 监听连接相关事件，更新状态文本
-socket.on('connect', () => { setConnectionStatus('已连接'); try { fetchFileList(); } catch (e) {} });
-socket.on('disconnect', () => setConnectionStatus('未连接'));
-socket.on('connect_error', () => setConnectionStatus('连接中'));
-socket.on('reconnect_attempt', () => setConnectionStatus('连接中'));
-socket.on('reconnect', () => { setConnectionStatus('已连接'); try { fetchFileList(); } catch (e) {} });
+// 监听连接相关事件，更新状态文本并维护重连标记
+socket.on('connect', () => { isReconnecting = false; setConnectionStatus('已连接'); try { fetchFileList(); } catch (e) {} });
+socket.on('disconnect', () => { isReconnecting = true; setConnectionStatus('连接中'); });
+socket.on('connect_error', () => { isReconnecting = true; setConnectionStatus('连接中'); });
+socket.on('reconnect_attempt', () => { isReconnecting = true; setConnectionStatus('连接中'); });
+socket.on('reconnect', () => { isReconnecting = false; setConnectionStatus('已连接'); try { fetchFileList(); } catch (e) {} });
+// 重连失败后恢复为未连接状态
+socket.on('reconnect_failed', () => { isReconnecting = false; setConnectionStatus('未连接'); });
+// 某些版本可能触发连接超时事件，保持为“连接中”以提示正在尝试
+socket.on('connect_timeout', () => { isReconnecting = true; setConnectionStatus('连接中'); });
 
 
 // === 结果缓冲与渲染 ===
@@ -55,6 +66,22 @@ const FLUSH_CHUNK_SIZE = 65536;   // 以 64KB 分块追加，避免一次性大�
 // 结果文本缓冲：批量 append，减少频繁的 DOM 触发
 let resultBuffer = '';
 let flushScheduled = false;
+// 结果刷新调度的可取消定时器/帧句柄
+let flushTimerId = null;
+let flushTimerType = null; // 'raf' | 'timeout' | null
+
+function cancelFlushTimer() {
+    try {
+        if (flushTimerType === 'raf' && flushTimerId != null && typeof window.cancelAnimationFrame === 'function') {
+            window.cancelAnimationFrame(flushTimerId);
+        } else if (flushTimerType === 'timeout' && flushTimerId != null) {
+            clearTimeout(flushTimerId);
+        }
+    } catch (e) {}
+    flushTimerId = null;
+    flushTimerType = null;
+    flushScheduled = false;
+}
 
 // === 预览设置（刷新页面或重启容器后生效） ===
 const PREVIEW_KEY = 'preview_enabled';
@@ -94,8 +121,26 @@ function enqueueResult(text) {
 function scheduleFlush() {
     if (flushScheduled) return;
     flushScheduled = true;
-    // 使用 rAF 在下一帧统一写入，提高渲染效率
-    (window.requestAnimationFrame || setTimeout)(flushResultNow, 16);
+    // 使用 rAF 在下一帧统一写入，提高渲染效率（可取消）
+    try {
+        if (typeof window.requestAnimationFrame === 'function') {
+            flushTimerType = 'raf';
+            flushTimerId = window.requestAnimationFrame(function(){
+                flushTimerId = null;
+                flushTimerType = null;
+                flushResultNow();
+            });
+        } else {
+            flushTimerType = 'timeout';
+            flushTimerId = setTimeout(function(){
+                flushTimerId = null;
+                flushTimerType = null;
+                flushResultNow();
+            }, 16);
+        }
+    } catch (e) {
+        try { setTimeout(flushResultNow, 16); } catch (e2) {}
+    }
 }
 
 // 立即将缓冲区内容写入结果区域（分块写入)
@@ -170,7 +215,8 @@ function aggressiveCompactResult() {
 // 更彻底的前端内存回收：释放结果区所有文本与缓冲引用
 function hardResetResults(tag) {
     try {
-        // 先尝试刷新缓冲再清空，以免残留未写入的数据影响后续状态
+        // 先取消已计划的刷新，再主动刷新一次，避免残留任务与竞态
+        try { cancelFlushTimer(); } catch (e) {}
         try { flushResultNow(); } catch (e) {}
 
         // 清空缓冲与写入计划
@@ -232,6 +278,8 @@ let matches = 0;
 let files_total = 0;
 let files_done = 0;
 let progressHideTimeout = null;
+// 多文件检索间隔定时器，取消时需清理
+let interFileDelayTimer = null;
 let fileType = 'other';
 let searchController = null;
 const inflightControllers = new Set();
@@ -243,6 +291,26 @@ let hasByteProgress = false;
 let lastSearchAll = false;
 // 标记是否已点击“清空”按钮，用于导出按钮仅提示
 let clearedAfterSearch = false;
+
+// 挂起的检索等待与监听引用，用于在取消时主动清理，避免内存泄漏
+let pendingSearchWaitResolve = null;
+let pendingSearchMessageHandler = null;
+let pendingSearchProgressHandler = null;
+
+function cleanupSearchWaitListeners() {
+    try {
+        if (pendingSearchMessageHandler) {
+            socket.off('message', pendingSearchMessageHandler);
+        }
+    } catch (e) {}
+    try {
+        if (pendingSearchProgressHandler) {
+            socket.off('progress', pendingSearchProgressHandler);
+        }
+    } catch (e) {}
+    pendingSearchMessageHandler = null;
+    pendingSearchProgressHandler = null;
+}
 
 // 根据文件扩展名粗略分类，用于调整进度条动画策略
 function classifyFileType(nameLower) {
@@ -443,10 +511,42 @@ window.addEventListener('DOMContentLoaded', function(){
     // 初始化预览开关（设置在刷新后生效）
     try { setupPreviewToggle(); } catch (e) {}
 
-    // 触发容器内进程热重载：每次页面打开或刷新时调用
     try {
         setConnectionStatus('连接中');
-        trackedFetch('/hot-reload', { method: 'POST' }, true).catch(() => {});
+    } catch (e) {}
+
+    // 首屏立即校验当前连接状态，避免需要二次刷新
+    try {
+        if (socket && socket.connected) {
+            isReconnecting = false;
+            setConnectionStatus('已连接');
+            try { fetchFileList(); } catch (e) {}
+        } else {
+            isReconnecting = true;
+        }
+    } catch (e) {}
+
+    // 轻量轮询保证状态实时、避免偶发事件丢失
+    try {
+        if (!statusInterval) {
+            statusInterval = setInterval(function(){
+                try {
+                    const el = document.getElementById('connectStatus');
+                    if (!el) return;
+                    if (socket && socket.connected) {
+                        if ((el.textContent || '').trim() !== '已连接') setConnectionStatus('已连接');
+                        isReconnecting = false;
+                    } else {
+                        const cur = (el.textContent || '').trim();
+                        if (isReconnecting) {
+                            if (cur !== '连接中') setConnectionStatus('连接中');
+                        } else {
+                            if (cur !== '未连接') setConnectionStatus('未连接');
+                        }
+                    }
+                } catch (e) {}
+            }, 800);
+        }
     } catch (e) {}
 
     // 初次加载文件列表，同时在连接恢复时也会自动刷新
@@ -457,7 +557,50 @@ window.addEventListener('DOMContentLoaded', function(){
         e.preventDefault();
         cancelSearch();
     });
+
+    // 初始化导出链接为纯后端下载，避免前端参与
+    try { setupExportLink(); } catch (e) {}
+    try { updateExportLink(); } catch (e) {}
 });
+
+// === 导出链接（纯后端下载） ===
+function updateExportLink() {
+    // 检索进行中不更新下载链接，避免拿到旧文件
+    if (running || pendingSubmit) return;
+    const kwRaw = document.getElementById('keyword') ? (document.getElementById('keyword').value || '') : '';
+    const kw = (kwRaw || '').trim().replace(/[^\\w\u4e00-\u9fa5\-_ ]/g, '');
+    const fileSel = document.getElementById('file');
+    const fileVal = fileSel ? (fileSel.value || '') : '';
+    const a = document.getElementById('exportLink');
+    if (!a) return;
+    // 关键词为空时不更新链接，避免误指向默认文件造成“数据丢失”的错觉
+    if (!kw) {
+        try { a.removeAttribute('href'); a.setAttribute('title', '请输入关键词后再下载'); } catch (e) {}
+        return;
+    }
+    const fallback = '/download?keyword=' + encodeURIComponent(kw) + '&file=' + encodeURIComponent(fileVal || '');
+    try {
+        trackedFetch('/export-info?keyword=' + encodeURIComponent(kw) + '&file=' + encodeURIComponent(fileVal || ''), {}, true)
+            .then(r => r.ok ? r.json() : Promise.reject())
+            .then(info => {
+                // 优先使用后端返回的直接下载链接（避免额外扫描与内存占用）
+                const href = (info && info.direct_download_url) ? info.direct_download_url : ((info && info.download_url) ? info.download_url : fallback);
+                a.href = href;
+                try { a.setAttribute('download', ''); } catch (e) {}
+            })
+            .catch(() => {
+                a.href = fallback;
+                try { a.setAttribute('download', ''); } catch (e) {}
+            });
+    } catch (e) {
+        a.href = fallback;
+        try { a.setAttribute('download', ''); } catch (e2) {}
+    }
+}
+
+function setupExportLink() {
+    // 仅在取消或检索完成后由事件驱动更新，不绑定输入实时更新
+}
 
 // === Socket 消息处理 ===
 socket.on('message', data => {
@@ -465,9 +608,16 @@ socket.on('message', data => {
     const text = data.message.replace(/\r?\n/g, '\n');
     const trimmed = text.trim();
 
+    // 若已点击取消，则忽略除状态类消息外的普通输出，避免前端继续累积文本
+    if (wasCancelled) {
+        const isStatus = (trimmed.includes('Cancelled') || trimmed.includes('Started') || trimmed.includes('Busy') || trimmed.includes('Done') || /^\s*\?\?/.test(trimmed));
+        if (!isStatus) return;
+    }
+
     // 拦截后端推送的连接状态文案，改为在状态区显示
     if (trimmed === 'Connected') { setConnectionStatus('已连接'); return; }
-    if (trimmed === 'Disconnected') { setConnectionStatus('未连接'); return; }
+    // 断开后立刻提示“连接中”，以符合重连中的真实状态
+    if (trimmed === 'Disconnected') { setConnectionStatus('连接中'); return; }
 
     if (text.includes('Cancelled')) {
         if (pendingSubmit) return;
@@ -482,6 +632,8 @@ socket.on('message', data => {
         progressHideTimeout = setTimeout(() => hideProgress(), 1200);
         // 取消后执行硬重置，确保结果区内存彻底释放
         hardResetResults('cancelled');
+        // 取消完成后刷新导出链接，确保指向最新文件
+        try { updateExportLink(); } catch (e) {}
         return;
     }
 
@@ -523,13 +675,10 @@ socket.on('message', data => {
         document.getElementById('submitBtn').disabled = false;
         clearTimeout(progressHideTimeout);
         progressHideTimeout = setTimeout(() => hideProgress(), 1200);
-        // 若开启预览，保留已展示内容，仅进行压缩以降低占用；
-        // 若关闭预览，则进行彻底重置以回收前端内存。
-        if (previewEnabled) {
-            try { aggressiveCompactResult(); } catch (e) {}
-        } else {
-            hardResetResults('done');
-        }
+        // 完成后：预览模式做轻量压缩保留结果；非预览模式不再强制清空，避免误判导致数据丢失
+        try { if (previewEnabled) aggressiveCompactResult(); } catch (_) {}
+        // 检索完成后刷新导出链接
+        try { updateExportLink(); } catch (e) {}
         return;
     }
 
@@ -545,9 +694,15 @@ socket.on('message', data => {
 
 let lastProgressAt = 0;
 const PROGRESS_THROTTLE_MS = 180;
+// 仅计数模式下用于保证进度条单调递增的上次显示值
+let lastPctShown = 0;
 
 // === 进度事件处理 ===
 socket.on('progress', data => {
+    // 在取消状态下忽略后续进度更新（保留取消事件），避免不必要的 UI 更新与内存占用
+    if (wasCancelled && (!data || data.phase !== 'cancelled')) {
+        return;
+    }
     // 只在单文件检索时更新匹配数，多文件检索时由sendKeyword函数控制
     if (typeof data.matches === 'number' && document.getElementById('file').value !== '__ALL__') {
         matches = data.matches;
@@ -598,16 +753,33 @@ socket.on('progress', data => {
     } else {
         pct = Math.min(100, Math.max(0, pct));
     }
-    // 仅当文件完成或收到搜索结束事件时才标记完成，避免压缩文件过早结束
-    if (reachedFileCompletion || reachedSearchEnd) {
+    // 非预览模式下，为确保导出写入完全结束之前不显示100%，强制卡在95%
+    if (!previewEnabled && running) {
+        pct = Math.min(95, Math.max(0, pct));
+    }
+    // 在“仅计数”模式中强制进度条保持正增长（单调不减）
+    if (!previewEnabled) {
+        pct = Math.max(pct, lastPctShown);
+        lastPctShown = pct;
+    }
+    // 仅在预览模式下：当文件完成或收到搜索结束事件时标记完成；
+    // 非预览模式下改由 Done 消息驱动完成状态，以确保导出写入完全结束
+    if (previewEnabled && (reachedFileCompletion || reachedSearchEnd)) {
         running = false;
         setProgressState('done', {fileType, preserveBarStyle: (fileType === 'compressed')});
         disableControls(false);
         document.getElementById('submitBtn').disabled = false;
         clearTimeout(progressHideTimeout);
         progressHideTimeout = setTimeout(() => hideProgress(), 1200);
-        // 进度判断到达完成时也压缩一次结果，消除顺序差异的占用
-        aggressiveCompactResult();
+        // 完成时仅在预览模式下做轻量压缩；非预览模式不再强制清空，统一到下一次提交时清理
+        try { if (previewEnabled) aggressiveCompactResult(); } catch (_) {}
+        // 在单文件完成或整个检索完成时更新导出链接
+        try {
+            const isSearchAll = (document.getElementById('file').value === '__ALL__');
+            if (reachedSearchEnd || !isSearchAll) {
+                updateExportLink();
+            }
+        } catch (e) {}
         return;
     }
     const now = Date.now();
@@ -629,6 +801,11 @@ async function sendKeyword() {
     lastSubmitAt = now;
     pendingSubmit = true;
     wasCancelled = false;
+    // 新检索开始前的预清理：避免残留监听/请求导致内存占用
+    try { cancelFlushTimer(); } catch (e) {}
+    try { cleanupSearchWaitListeners(); } catch (e) {}
+    try { cancelAllFetches(); } catch (e) {}
+    try { if (searchController) { searchController.abort(); searchController = null; } } catch (e) {}
     // 开始新检索时重置清空标记
     clearedAfterSearch = false;
 
@@ -643,6 +820,8 @@ async function sendKeyword() {
     previewEnabled = !!previewPref;
     // 按当前会话预览状态和模式调整保留参数
     reconfigureRetentionForMode(lastSearchAll);
+    // 在下一次提交时统一清空上次结果（不在完成时清空）
+    try { hardResetResults('new_submit'); } catch (e) {}
 
     if (file === '__ALL__') {
         const list = await trackedFetch('/files').then(r => r.ok ? r.json() : Promise.reject()).catch(() => []);
@@ -667,9 +846,17 @@ async function sendKeyword() {
             
             // 在进行下一个文件检索前添加1秒缓冲时间
             if (i < list.length - 1 && !wasCancelled) {
-                await new Promise(resolve => setTimeout(resolve, 1000));
+                await new Promise(resolve => {
+                    try { interFileDelayTimer && clearTimeout(interFileDelayTimer); } catch (e) {}
+                    interFileDelayTimer = setTimeout(function(){
+                        interFileDelayTimer = null;
+                        resolve();
+                    }, 1000);
+                });
             }
         }
+        // 在全量检索完成后刷新导出链接
+        try { if (!wasCancelled) updateExportLink(); } catch (e) {}
         pendingSubmit = false;
         return;
     }
@@ -692,16 +879,22 @@ async function singleSearch(kw, before, after, file, scope, resetAll = false, fi
     files_total = 0;
     files_done = 0;
     showProgress();
+    // 新检索开始时重置仅计数模式下的单调进度参考值
+    lastPctShown = 0;
     setProgressState('running', {pct: 0, text: '检索中', file: file});
     document.getElementById('submitBtn').disabled = true;
 
     searchController = new AbortController();
     try {
-        const payload = {keyword: kw, context_before: before, context_after: after, file};
+        // 非预览模式保留上下文参数以便后端写入导出文件时格式一致
+        const beforeEff = before;
+        const afterEff  = after;
+        const payload = {keyword: kw, context_before: beforeEff, context_after: afterEff, file};
         if (scope) payload.scope = scope;
         if (resetAll) payload.reset_all = true;
         if (finalAll) payload.final_all = true;
-        const resp = await fetch('/search', {
+        const endpoint = previewEnabled ? '/search' : '/search-count';
+        const resp = await fetch(endpoint, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify(payload),
@@ -709,17 +902,26 @@ async function singleSearch(kw, before, after, file, scope, resetAll = false, fi
         });
         if (!resp.ok) throw new Error('search failed');
         
-        // 等待搜索完成并获取匹配数
+        // 等待搜索完成并获取匹配数（可被取消解阻）
         await new Promise(resolve => {
-            const onDone = () => { 
-                socket.off('message', handler); 
-                socket.off('progress', progressHandler);
-                resolve(); 
+            const onDone = () => {
+                cleanupSearchWaitListeners();
+                pendingSearchWaitResolve = null;
+                resolve();
             };
             const handler = (data) => {
                 if (data && typeof data.message === 'string') {
                     const msg = data.message;
-                    if (msg.includes('Done') || msg.includes('Cancelled') || msg.includes('Busy')) {
+                    // 非预览模式：仅在 Done/Cancelled/Error/Busy 时结束；不在 search_end 结束
+                    // 预览模式：保留原有行为，search_end 也可结束
+                    const allowSearchEnd = !!previewEnabled;
+                    if (
+                        msg.includes('Done') ||
+                        msg.includes('Cancelled') ||
+                        msg.includes('Busy') ||
+                        msg.includes('Error') ||
+                        (allowSearchEnd && msg.includes('search_end'))
+                    ) {
                         onDone();
                     }
                 }
@@ -728,7 +930,15 @@ async function singleSearch(kw, before, after, file, scope, resetAll = false, fi
                 if (typeof data.matches === 'number') {
                     currentFileMatches = data.matches;
                 }
+                // 非预览模式：不在 search_end 解阻；预览模式维持原行为
+                if (data && (data.phase === 'error' || data.phase === 'cancelled' || (previewEnabled && data.phase === 'search_end'))) {
+                    onDone();
+                }
             };
+            // 记录监听与解阻函数，以便取消时主动清理
+            pendingSearchMessageHandler = handler;
+            pendingSearchProgressHandler = progressHandler;
+            pendingSearchWaitResolve = resolve;
             socket.on('message', handler);
             socket.on('progress', progressHandler);
         });
@@ -746,6 +956,9 @@ async function singleSearch(kw, before, after, file, scope, resetAll = false, fi
  */
 function cancelSearch() {
     console.log('Canceling search...');
+    // 清理间隔定时器与结果刷新定时器
+    try { if (interFileDelayTimer) { clearTimeout(interFileDelayTimer); interFileDelayTimer = null; } } catch (e) {}
+    try { cancelFlushTimer(); } catch (e) {}
     
     // Abort any active fetch requests
     if (searchController) { 
@@ -759,6 +972,20 @@ function cancelSearch() {
     
     // Cancel all tracked fetch requests
     cancelAllFetches();
+
+    // 立即关闭预览并彻底清空结果，防止取消到达前的输出继续堆积
+    previewEnabled = false;
+    try { hardResetResults('cancel_click'); } catch (e) {}
+
+    // 主动清理挂起的检索监听并解阻等待的 Promise，避免残留监听造成泄漏
+    try { cleanupSearchWaitListeners(); } catch (e) {}
+    try {
+        if (typeof pendingSearchWaitResolve === 'function') {
+            const r = pendingSearchWaitResolve;
+            pendingSearchWaitResolve = null;
+            r();
+        }
+    } catch (e) {}
     
     // Update UI to show canceling state
     const badge = document.getElementById('progressBadge');
@@ -825,41 +1052,29 @@ function clearResult() {
     }
 }
 
-// === 导出结果 ===
-function exportResult() {
-    const kwRaw = document.getElementById('keyword').value || '';
-    const kw = kwRaw.trim().replace(/[^\w\u4e00-\u9fa5\-_ ]/g, '');
-    const fileSel = document.getElementById('file');
-    const fileVal = fileSel ? (fileSel.value || '') : '';
-
-    // 全文件模式：下载后端按时间戳命名的最新文件 <keyword>__all_<YYYY-MM-DD>_<ts>.txt
-    // 单文件模式：保持原路由参数以下载对应文件的最新导出
-    const url = '/download?keyword=' + encodeURIComponent(kw || 'search') +
-                '&file=' + encodeURIComponent(fileVal || '');
-
-    const a = document.createElement('a');
-    a.href = url;
-    a.target = '_blank';
-    a.rel = 'noopener';
-    a.setAttribute('download', '');
-    document.body.appendChild(a); a.click(); a.remove();
-
-    // 可选提示：如果用户之前点击过“清空”，提示当前导出的是后台文件
-    if (clearedAfterSearch) {
-        try { console.info('提示：已清空，导出的是后端文件。'); } catch (e) {}
-    }
-
-    // 导出完成后主动进行一次压缩，以便释放前端大文本的内存占用
-    try { compactResultIfLarge(); } catch (e) {}
-    try { reportMemory('after_export'); } catch (e) {}
+// 页面关闭时：立即触发取消与热重载；页面隐藏仅做前端清理
+function sendCloseBeacons() {
+    try {
+        if (navigator.sendBeacon) {
+            const ping = new Blob(['1'], { type: 'text/plain' });
+            // 先发取消，释放后端资源
+            try { navigator.sendBeacon('/cancel', ping); } catch (e) {}
+            // 再发热重载，触发容器/进程级重启
+            try { navigator.sendBeacon('/hot-reload', ping); } catch (e) {}
+        }
+    } catch (e) {}
 }
 
 window.addEventListener('beforeunload', () => {
+    // 本地前端清理（与“取消”一致），同时发信标提高可靠性
     try { cancelSearch(); } catch (e) {}
-    try {
-        if (navigator.sendBeacon) {
-            const data = new Blob(['1'], { type: 'text/plain' });
-            navigator.sendBeacon('/hot-reload', data);
-        }
-    } catch (e) {}
+    try { if (statusInterval) { clearInterval(statusInterval); statusInterval = null; } } catch (e) {}
+    sendCloseBeacons();
+});
+
+window.addEventListener('pagehide', () => {
+    // 页面隐藏时不触发后端热重载，仅进行本地清理
+    try { cancelSearch(); } catch (e) {}
+    // 不发送信标，避免隐藏/后台时触发热重载
+    try { if (statusInterval) { clearInterval(statusInterval); statusInterval = null; } } catch (e) {}
 });
