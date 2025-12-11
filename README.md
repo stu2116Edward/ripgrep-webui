@@ -1,6 +1,8 @@
 # ripgrep-webui
 Visual Text Content Retrieval Tool
 
+**注意**：如果是大文件检索或文件中关键字匹配数量过多建议关闭预览模式，如果检索崩溃建议刷新页面或手动重启容器  
+
 本项目是基于 https://github.com/BurntSushi/ripgrep 实现的webui可视化操作工具  
 注意：在检索excel格式文件如`xls`,`xlsx`格式建议先转为csv格式（对于较大的excel格式文件会检索失败）
 
