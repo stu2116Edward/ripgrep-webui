@@ -17,11 +17,12 @@ import subprocess
 import tempfile
 import gc
 
-from config import DEFAULT_DATA_DIR, EXCEL_EXTS, CSV_EXTS, TEXT_EXTS
+from config import DEFAULT_DATA_DIR, EXCEL_EXTS, CSV_EXTS, TEXT_EXTS, SEARCH_RG_QUEUE_MAXSIZE
 from utils import (
     get_app, get_socketio, emit_message_utf, emit_progress_ex, has_cmd,
     sanitize_keyword, classify_file_type, strip_single_compress_ext, popen_creationflags,
-    is_single_file_compressed, is_archive_multi_file, is_excel_file, is_csv_file
+    is_single_file_compressed, is_archive_multi_file, is_excel_file, is_csv_file,
+    trim_process_memory
 )
 from export_manager import start_export_stream, append_export_text, close_export_stream
 from file_handlers import (
@@ -53,7 +54,7 @@ def check_rg_supports_label():
         return _RG_SUPPORTS_LABEL
 
 
-def start_search(keyword: str, context_before: int, context_after: int, file: str, scope_override: str = None, reset_all: bool = False, final_all: bool = False):
+def start_search(keyword: str, context_before: int, context_after: int, file: str, scope_override: str = None, reset_all: bool = False, final_all: bool = False, count_only: bool = False):
     """
     启动搜索：复用原始流程与细节，返回字符串状态（'Started' 或错误字符串）。
     """
@@ -65,8 +66,12 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
             pass
         return "Busy"
 
-    # 在开始新搜索时重置取消标志
+    # 在开始新搜索时重置取消标志，并进行一次轻量内存修剪
     pm.cancel_requested = False
+    try:
+        trim_process_memory()
+    except Exception:
+        pass
 
     data_dir = DEFAULT_DATA_DIR
     if not os.path.isdir(data_dir):
@@ -82,9 +87,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
         emit_message_utf('ripgrep 未安装或不可用，请在系统 PATH 中提供 rg。')
         return "rg not found"
 
-    # 预创建/管理导出写入流：
-    # - all 模式：在本次提交的第一次调用（reset_all=True）创建新文件；后续调用复用同一会话写入流
-    # - single 模式：每次调用创建新的单文件导出
+    # 预创建/管理导出写入流
     try:
         safe_kw_init = sanitize_keyword(keyword)
         scope = 'all' if (file == '__ALL__') else 'single'
@@ -141,7 +144,8 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
     total_files = 0
 
     try:
-        q = queue.Queue()
+        # 使用有界队列限制rg输出缓冲，施加背压避免内存增长（从配置读取）
+        q = queue.Queue(maxsize=SEARCH_RG_QUEUE_MAXSIZE)
 
         def forward_proc_stdout(p):
             pid = getattr(p, 'pid', id(p))
@@ -229,6 +233,44 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
             _register_proc(rg_proc)
             return rg_proc
 
+        def schedule_temp_dir_cleanup_for_proc(proc, temp_dir):
+            def _cleanup(p=proc, d=temp_dir):
+                try:
+                    if hasattr(p, 'wait'):
+                        p.wait()
+                except Exception:
+                    pass
+                try:
+                    shutil.rmtree(d)
+                except Exception:
+                    pass
+                try:
+                    if d in pm.temp_dirs:
+                        pm.temp_dirs.remove(d)
+                except Exception:
+                    pass
+                try:
+                    gc.collect()
+                except Exception:
+                    pass
+            try:
+                t = threading.Thread(target=_cleanup, daemon=True)
+                t.start()
+            except Exception:
+                try:
+                    if proc and getattr(proc, 'poll', lambda: None)() is not None:
+                        try:
+                            shutil.rmtree(temp_dir)
+                        except Exception:
+                            pass
+                        try:
+                            if temp_dir in pm.temp_dirs:
+                                pm.temp_dirs.remove(temp_dir)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
         # Helper: 处理单个文件（包括压缩/归档/Excel）
         def handle_single_file(search_path_local, basename_label=None):
             nonlocal total_files
@@ -246,7 +288,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                         decompress_proc = subprocess.Popen(
                             cmd,
                             stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL,
                             shell=False,
                             preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None,
                             creationflags=popen_creationflags()
@@ -266,6 +308,14 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                         proc.stdout.close()
                                     except Exception:
                                         pass
+                                    try:
+                                        proc.wait()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        trim_process_memory()
+                                    except Exception:
+                                        pass
                             start_rg_for_path('-', label=label, python_stream_feed=feed_fn)
                         else:
                             def feed_fn(w, proc=decompress_proc, lb=label, orig=search_path_local):
@@ -283,6 +333,14 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                 finally:
                                     try:
                                         proc.stdout.close()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        proc.wait()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        trim_process_memory()
                                     except Exception:
                                         pass
                             start_rg_for_path('-', label=label, python_stream_feed=feed_fn)
@@ -354,7 +412,8 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                             for _ in fns:
                                 cnt += 1
                         total_files += cnt if cnt > 0 else 1
-                        start_rg_for_path(temp_dir_for_archive)
+                        _p = start_rg_for_path(temp_dir_for_archive)
+                        schedule_temp_dir_cleanup_for_proc(_p, temp_dir_for_archive)
                     except Exception:
                         try:
                             shutil.rmtree(temp_dir_for_archive)
@@ -413,7 +472,8 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                 for _ in fns:
                                     cnt += 1
                             total_files += cnt if cnt > 0 else 1
-                            start_rg_for_path(temp_dir_for_archive)
+                            _p = start_rg_for_path(temp_dir_for_archive)
+                            schedule_temp_dir_cleanup_for_proc(_p, temp_dir_for_archive)
                         except Exception:
                             try:
                                 shutil.rmtree(temp_dir_for_archive)
@@ -471,7 +531,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                     try:
                                         dec_cmd = ['7z', 'e', '-so', search_path_local, nm]
                                         dec_proc = subprocess.Popen(
-                                            dec_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                            dec_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                             shell=False, preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None,
                                             creationflags=popen_creationflags()
                                         )
@@ -490,6 +550,14 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                             copy_fileobj_chunked(dec_proc.stdout, w, progress_cb=_cb, bytes_total=sz)
                                         try:
                                             dec_proc.stdout.close()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            dec_proc.wait()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            trim_process_memory()
                                         except Exception:
                                             pass
                                     except Exception:
@@ -519,13 +587,17 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                             try:
                                 extract_cmd = ['7z', 'x', '-y', search_path_local, f'-o{temp_dir_for_archive}']
                                 extract_proc = subprocess.Popen(
-                                    extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False,
+                                    extract_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False,
                                     preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None,
                                     creationflags=popen_creationflags()
                                 )
                                 extra_procs_local.append(extract_proc)
                                 pm.extra_procs.append(extract_proc)
-                                out, err = extract_proc.communicate()
+                                extract_proc.wait()
+                                try:
+                                    trim_process_memory()
+                                except Exception:
+                                    pass
                                 if extract_proc.returncode == 0:
                                     extracted_ok = True
                             except Exception:
@@ -537,7 +609,8 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                 for _ in fns:
                                     cnt += 1
                             total_files += cnt if cnt > 0 else 1
-                            start_rg_for_path(temp_dir_for_archive)
+                            _p = start_rg_for_path(temp_dir_for_archive)
+                            schedule_temp_dir_cleanup_for_proc(_p, temp_dir_for_archive)
                         else:
                             try:
                                 shutil.rmtree(temp_dir_for_archive)
@@ -558,7 +631,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                     try:
                                         dec_cmd = ['7z', 'e', '-so', search_path_local, nm]
                                         dec_proc = subprocess.Popen(
-                                            dec_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                            dec_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                             shell=False, preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None,
                                             creationflags=popen_creationflags()
                                         )
@@ -579,6 +652,10 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                             dec_proc.stdout.close()
                                         except Exception:
                                             pass
+                                        try:
+                                            dec_proc.wait()
+                                        except Exception:
+                                            pass
                                     except Exception:
                                         pass
                                 try:
@@ -591,46 +668,9 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                             streamed_local = False
                     
                     if not streamed_local:
-                        try:
-                            import py7zr
-                            with py7zr.SevenZipFile(search_path_local, mode='r') as z:
-                                try:
-                                    names = z.getnames()
-                                except Exception:
-                                    names = []
-                                for name in names:
-                                    if not name:
-                                        continue
-                                    label = os.path.basename(search_path_local) + '/' + name
-                                    def feed_fn(w, p=search_path_local, nm=name, lb=label):
-                                        import py7zr as _py7zr
-                                        try:
-                                            with _py7zr.SevenZipFile(p, mode='r') as z2:
-                                                try:
-                                                    data = z2.read([nm]).get(nm)
-                                                except Exception:
-                                                    data = None
-                                                if data is None:
-                                                    return
-                                                lower = nm.lower()
-                                                if is_excel_file(lower):
-                                                    stream_excel_bytes_to_writer(lower, data, w)
-                                                elif is_csv_file(lower):
-                                                    bio = io.BytesIO(data)
-                                                    stream_csv_fileobj_to_writer(bio, w)
-                                                else:
-                                                    bio = io.BytesIO(data)
-                                                    copy_fileobj_chunked(bio, w)
-                                        except Exception:
-                                            pass
-                                    try:
-                                        start_rg_for_path('-', label=label, python_stream_feed=feed_fn)
-                                        total_files += 1
-                                    except Exception:
-                                        pass
-                            streamed_local = True
-                        except Exception:
-                            streamed_local = False
+                        # 避免使用 py7zr 将成员完整读入内存导致峰值增长；
+                        # 在无法使用系统 7z 流式的情况下，回退到解包到临时目录的方式。
+                        streamed_local = False
 
                     if not streamed_local:
                         # 7z 流式失败，回退到解包临时目录
@@ -648,13 +688,13 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                             try:
                                 extract_cmd = ['7z', 'x', '-y', search_path_local, f'-o{temp_dir_for_archive}']
                                 extract_proc = subprocess.Popen(
-                                    extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False,
+                                    extract_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False,
                                     preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None,
                                     creationflags=popen_creationflags()
                                 )
                                 extra_procs_local.append(extract_proc)
                                 pm.extra_procs.append(extract_proc)
-                                out, err = extract_proc.communicate()
+                                extract_proc.wait()
                                 if extract_proc.returncode == 0:
                                     extracted_ok = True
                             except Exception:
@@ -666,7 +706,8 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                 for _ in fns:
                                     cnt += 1
                             total_files += cnt if cnt > 0 else 1
-                            start_rg_for_path(temp_dir_for_archive)
+                            _p = start_rg_for_path(temp_dir_for_archive)
+                            schedule_temp_dir_cleanup_for_proc(_p, temp_dir_for_archive)
                         else:
                             try:
                                 shutil.rmtree(temp_dir_for_archive)
@@ -929,16 +970,19 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                     before_lines.pop(0)
                             else:
                                 append_export_text(safe_kw, line_text + '\n', scope=scope)
-                                emit_message_utf(line_text + '\n')
+                                if not count_only:
+                                    emit_message_utf(line_text + '\n')
                                 owner_has_output[owner] = True
                                 after_emit_count += 1
                                 if after_emit_count >= context_after_n:
-                                    match_count += 1
-                                    try:
-                                        elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
-                                    except Exception:
-                                        elapsed_ms_total = 0
-                                    emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
+                                    if not count_only:
+                                        match_count += 1
+                                        try:
+                                            elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
+                                        except Exception:
+                                            elapsed_ms_total = 0
+                                        emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
+                                    # 无论是否为计数模式，都完成当前块并重置状态，确保下一块按“非首块”处理插入空行
                                     first_block = False
                                     try:
                                         before_lines.append(block_main)
@@ -958,48 +1002,82 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                             data = obj.get('data', {})
                             line_text = (data.get('lines', {}).get('text', '') or '').strip()
                             if not block_ready:
-                                if not first_block:
-                                    try:
-                                        append_export_text(safe_kw, '\n', scope=scope)
-                                        emit_message_utf('\n')
-                                        owner_has_output[owner] = True
-                                    except Exception:
-                                        pass
-                                for t in before_lines:
-                                    append_export_text(safe_kw, t + '\n', scope=scope)
-                                    emit_message_utf(t + '\n')
-                                    owner_has_output[owner] = True
-                                append_export_text(safe_kw, line_text + '\n', scope=scope)
-                                emit_message_utf(line_text + '\n')
-                                owner_has_output[owner] = True
-                                block_main = line_text
-                                block_ready = True
-                                after_emit_count = 0
-                                block_match_count = 1
-                                after_lines = []
-                                if context_after_n == 0:
+                                if count_only:
                                     match_count += 1
                                     try:
                                         elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
                                     except Exception:
                                         elapsed_ms_total = 0
                                     emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
+                                    # 写入与预览一致的分隔与前后文，并开启 block 以便 after 上下文写入
+                                    try:
+                                        if not first_block:
+                                            append_export_text(safe_kw, '\n', scope=scope)
+                                        for t in before_lines:
+                                            append_export_text(safe_kw, t + '\n', scope=scope)
+                                        append_export_text(safe_kw, line_text + '\n', scope=scope)
+                                        owner_has_output[owner] = True
+                                        block_main = line_text
+                                        block_ready = True
+                                        after_emit_count = 0
+                                        block_match_count = 1
+                                        after_lines = []
+                                    except Exception:
+                                        pass
+                                    # 首次块写入完成后再标记，避免在开头插入空行
                                     first_block = False
-                                    block_ready = False
-                                    block_main = None
-                                    before_lines = []
+                                    if context_after_n == 0:
+                                        block_ready = False
+                                        block_main = None
+                                        before_lines = []
+                                        after_emit_count = 0
+                                        after_lines = []
+                                        block_match_count = 0
+                                else:
+                                    if not first_block:
+                                        try:
+                                            append_export_text(safe_kw, '\n', scope=scope)
+                                            emit_message_utf('\n')
+                                            owner_has_output[owner] = True
+                                        except Exception:
+                                            pass
+                                    for t in before_lines:
+                                        append_export_text(safe_kw, t + '\n', scope=scope)
+                                        emit_message_utf(t + '\n')
+                                        owner_has_output[owner] = True
+                                    append_export_text(safe_kw, line_text + '\n', scope=scope)
+                                    emit_message_utf(line_text + '\n')
+                                    owner_has_output[owner] = True
+                                    block_main = line_text
+                                    block_ready = True
                                     after_emit_count = 0
+                                    block_match_count = 1
                                     after_lines = []
-                                    block_match_count = 0
+                                    if context_after_n == 0:
+                                        match_count += 1
+                                        try:
+                                            elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
+                                        except Exception:
+                                            elapsed_ms_total = 0
+                                        emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
+                                        first_block = False
+                                        block_ready = False
+                                        block_main = None
+                                        before_lines = []
+                                        after_emit_count = 0
+                                        after_lines = []
+                                        block_match_count = 0
                             else:
                                 try:
                                     while after_emit_count < context_after_n:
                                         append_export_text(safe_kw, '\n', scope=scope)
-                                        emit_message_utf('\n')
+                                        if not count_only:
+                                            emit_message_utf('\n')
                                         owner_has_output[owner] = True
                                         after_emit_count += 1
                                 except Exception:
                                     pass
+                                # 无论是否仅计数模式，此处都在“补齐上一块 after 上下文”后统计上一块匹配
                                 match_count += 1
                                 try:
                                     elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
@@ -1011,10 +1089,12 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                 for i in range(context_before_n):
                                     t = before_lines[i] if i < len(before_lines) else ''
                                     append_export_text(safe_kw, t + '\n', scope=scope)
-                                    emit_message_utf(t + '\n')
+                                    if not count_only:
+                                        emit_message_utf(t + '\n')
                                     owner_has_output[owner] = True
                                 append_export_text(safe_kw, line_text + '\n', scope=scope)
-                                emit_message_utf(line_text + '\n')
+                                if not count_only:
+                                    emit_message_utf(line_text + '\n')
                                 owner_has_output[owner] = True
                                 block_main = line_text
                                 block_ready = True
@@ -1022,23 +1102,25 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                 block_match_count = 1
                                 after_lines = []
 
-                        elif typ == 'end':
+                        if typ == 'end':
                             # 结束当前文件：完成 after 缓冲并统计
                             if block_ready:
                                 try:
                                     while after_emit_count < context_after_n:
                                         append_export_text(safe_kw, '\n', scope=scope)
-                                        emit_message_utf('\n')
+                                        if not count_only:
+                                            emit_message_utf('\n')
                                         owner_has_output[owner] = True
                                         after_emit_count += 1
                                 except Exception:
                                     pass
-                                match_count += 1
-                                try:
-                                    elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
-                                except Exception:
-                                    elapsed_ms_total = 0
-                                emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
+                                if not count_only:
+                                    match_count += 1
+                                    try:
+                                        elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
+                                    except Exception:
+                                        elapsed_ms_total = 0
+                                    emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
                                 first_block = False
                                 block_ready = False
                                 block_main = None
@@ -1057,7 +1139,8 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                             try:
                                 if owner_has_output.get(owner):
                                     append_export_text(safe_kw, '\n', scope=scope)
-                                    emit_message_utf('\n')
+                                    if not count_only:
+                                        emit_message_utf('\n')
                                     owner_has_output[owner] = False
                             except Exception:
                                 pass
@@ -1081,7 +1164,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                             except Exception:
                                 pass
 
-                            # 每个文件检索完成后主动回收局部状态与触发垃圾回收，降低长跑内存占用
+                            # 每个文件检索完成后主动回收局部状态并进行内存修剪，降低长跑内存占用
                             try:
                                 # 清理与该 owner 相关的临时映射，避免集合无限增长
                                 try:
@@ -1106,9 +1189,13 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                     after_emit_count = 0
                                 except Exception:
                                     pass
-                                # 触发一次垃圾回收（轻量，确保大型对象尽快回收）
+                                # 触发一次垃圾回收与进程内存修剪（轻量，确保大型对象尽快回收并释放工作集）
                                 try:
                                     gc.collect()
+                                except Exception:
+                                    pass
+                                try:
+                                    trim_process_memory()
                                 except Exception:
                                     pass
                             except Exception:
@@ -1149,7 +1236,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                     pass
                 pm.proc = None
                 try:
-                    if scope == 'single' or (scope == 'all' and final_all):
+                    if (scope == 'single' or (scope == 'all' and final_all)):
                         close_export_stream(sanitize_keyword(keyword))
                 except Exception:
                     pass
@@ -1208,9 +1295,13 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                 except Exception:
                     pass
 
-                # 触发垃圾回收，确保在“完成”消息前尽量释放内存
+                # 触发垃圾回收与进程内存修剪，确保在“完成”消息前尽量释放内存
                 try:
                     gc.collect()
+                except Exception:
+                    pass
+                try:
+                    trim_process_memory()
                 except Exception:
                     pass
 
