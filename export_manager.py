@@ -10,6 +10,13 @@ import time
 import queue
 import threading
 import gc
+from config import (
+    EXPORT_WRITE_QUEUE_MAXSIZE,
+    EXPORT_WRITE_BUFFER_SIZE,
+    EXPORT_WRITER_BATCH_MAX_ITEMS,
+    EXPORT_WRITER_BATCH_MAX_BYTES,
+    EXPORT_WRITER_FLUSH_INTERVAL_MS,
+)
 
 # 后台导出文件的流式写入句柄（按安全化后的关键字区分）
 export_streams = {}
@@ -78,33 +85,105 @@ def start_export_stream(safe_kw: str, scope: str = 'single'):
         else:
             filename = f"{safe_kw}__single_{today}_{ts}.txt"
         filepath = os.path.join(exports_dir, filename)
-        # all 采用追加模式，single 采用覆盖模式
-        fh = open(filepath, 'w', encoding='utf-8')
-        q = queue.Queue()
+        # all 采用追加模式，single 采用覆盖模式；使用较大缓冲与错误替换提升吞吐与稳健性
+        mode = 'a' if scope == 'all' else 'w'
+        fh = open(filepath, mode, encoding='utf-8', errors='replace', buffering=EXPORT_WRITE_BUFFER_SIZE)
+        # 使用有界队列限制写入缓冲，阻塞生产避免内存增长（从配置读取）
+        q = queue.Queue(maxsize=EXPORT_WRITE_QUEUE_MAXSIZE)
 
         def _writer_loop():
+            last_flush_ns = time.perf_counter_ns()
             try:
                 while True:
                     item = q.get()
                     if item is None:
+                        # 收到终止信号：在退出前尽可能排空队列，避免尾部数据丢失
+                        try:
+                            drain_bulk = []
+                            drain_len = 0
+                            # 非阻塞地持续提取剩余项直到队列为空
+                            while True:
+                                try:
+                                    nxt = q.get_nowait()
+                                except Exception:
+                                    break
+                                if nxt is None:
+                                    # 多个终止信号时跳过即可
+                                    continue
+                                if not isinstance(nxt, str):
+                                    try:
+                                        nxt = str(nxt)
+                                    except Exception:
+                                        nxt = ''
+                                drain_bulk.append(nxt)
+                                drain_len += len(nxt)
+                                # 分批写入，避免一次性大字符串阻塞
+                                if drain_len >= int(EXPORT_WRITER_BATCH_MAX_BYTES) or len(drain_bulk) >= int(EXPORT_WRITER_BATCH_MAX_ITEMS):
+                                    try:
+                                        fh.writelines(drain_bulk)
+                                    except Exception:
+                                        pass
+                                    drain_bulk = []
+                                    drain_len = 0
+                            # 将最后一批剩余数据写盘
+                            if drain_bulk:
+                                try:
+                                    fh.writelines(drain_bulk)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        # 由 finally 负责刷新与关闭
                         break
+                    # 聚合队列中的多项后一次性写盘，减少系统调用
                     if not isinstance(item, str):
                         try:
                             item = str(item)
                         except Exception:
                             item = ''
-                    try:
-                        sanitized = item.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
-                        fh.write(sanitized)
+                    bulk = [item]
+                    total_len = len(item)
+                    # 尝试非阻塞地继续获取更多项，直到达到批量上限
+                    for _ in range(max(1, int(EXPORT_WRITER_BATCH_MAX_ITEMS) - 1)):
                         try:
-                            fh.flush()
+                            nxt = q.get_nowait()
+                        except Exception:
+                            break
+                        if nxt is None:
+                            # 将终止信号保留在队列尾部处理：当前批次写入后结束循环
+                            # 注意：不再继续获取后续项，避免越过终止信号导致竞态丢失
+                            q.put(None)
+                            break
+                        if not isinstance(nxt, str):
+                            try:
+                                nxt = str(nxt)
+                            except Exception:
+                                nxt = ''
+                        bulk.append(nxt)
+                        total_len += len(nxt)
+                        if total_len >= int(EXPORT_WRITER_BATCH_MAX_BYTES):
+                            break
+                    try:
+                        fh.writelines(bulk)
+                        # 周期性刷新（如果启用）
+                        try:
+                            if EXPORT_WRITER_FLUSH_INTERVAL_MS and EXPORT_WRITER_FLUSH_INTERVAL_MS > 0:
+                                now_ns = time.perf_counter_ns()
+                                if (now_ns - last_flush_ns) >= int(EXPORT_WRITER_FLUSH_INTERVAL_MS) * 1_000_000:
+                                    fh.flush()
+                                    last_flush_ns = now_ns
                         except Exception:
                             pass
                     except Exception:
                         pass
             finally:
+                # 确保在退出前完全刷新到磁盘并关闭句柄
                 try:
                     fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except Exception:
+                        pass
                 except Exception:
                     pass
                 try:
@@ -132,6 +211,7 @@ def append_export_text(safe_kw: str, text: str, scope: str = None):
         q = info and info.get('queue')
         if not q:
             return
+        # 阻塞追加写入，避免积压导致内存增长
         q.put(text)
     except Exception:
         pass
@@ -145,52 +225,19 @@ def close_export_stream(safe_kw: str):
             return
         q = info.get('queue')
         t = info.get('thread')
-        # 在发送终止标志之前尽量清空队列，避免大文本在内存中排队等待写盘
+        # 发送终止标志，由写入线程负责排空并最终刷新；避免在关闭时丢失尚未写盘的数据
         try:
             if q:
-                try:
-                    # 优先使用内部队列快速清空（带锁，尽量安全）
-                    if hasattr(q, 'mutex') and hasattr(q, 'queue'):
-                        with q.mutex:
-                            try:
-                                q.queue.clear()
-                            except Exception:
-                                # 兜底：逐条非阻塞清空
-                                pass
-                    # 兜底再次尝试逐条非阻塞清理
-                    while True:
-                        try:
-                            q.get_nowait()
-                        except Exception:
-                            break
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            if q:
+                # 发送终止标志，并阻塞等待写入线程完整退出，避免丢失队列尾项
                 q.put(None)
         except Exception:
             pass
         try:
             if t:
-                t.join(timeout=1.0)
+                t.join()
         except Exception:
             pass
-        fh = info.get('fh')
-        if fh:
-            try:
-                fh.flush()
-                try:
-                    os.fsync(fh.fileno())
-                except Exception:
-                    pass
-            except Exception:
-                pass
-            try:
-                fh.close()
-            except Exception:
-                pass
+        # 句柄关闭由写入线程负责；此处不再二次关闭，避免竞态
         # 主动触发一次垃圾回收，加速释放写入缓冲与队列残留对象
         try:
             gc.collect()
