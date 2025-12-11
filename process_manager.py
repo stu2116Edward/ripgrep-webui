@@ -12,8 +12,9 @@ import shutil
 import signal
 import threading
 import subprocess
+import gc
 
-from utils import emit_message_utf, emit_progress_ex
+from utils import emit_message_utf, emit_progress_ex, trim_process_memory
 from export_manager import close_all_export_streams
 
 # 全局状态
@@ -155,6 +156,15 @@ def cancel():
 
     proc = None
     _proc_label_map = {}
+    # 在返回前主动进行垃圾回收与进程工作集修剪，尽量立刻归还内存
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        trim_process_memory()
+    except Exception:
+        pass
     try:
         elapsed_ms_total = int((time.perf_counter_ns() - start_ns) / 1_000_000)
     except Exception:
@@ -210,11 +220,7 @@ def trigger_hot_reload_async():
     _proc_label_map = {}
 
     def _do_restart():
-        # 短暂等待以让触发方继续返回
-        try:
-            time.sleep(0.2)
-        except Exception:
-            pass
+        # 立即执行重启，无需额外等待，确保页面关闭后毫不停顿
         try:
             # 在容器环境内优先通过父进程/1号进程终止触发重启
             in_docker = False
