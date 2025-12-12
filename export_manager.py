@@ -68,18 +68,19 @@ def start_export_stream(safe_kw: str, scope: str = 'single'):
     """
     import datetime
     try:
-        # 若已存在同关键字的导出流，先关闭以避免线程与句柄泄漏
+        # 若已存在同关键字+范围的导出流，先关闭以避免线程与句柄泄漏
         try:
-            if safe_kw in export_streams:
-                # 始终关闭旧会话，确保新文件创建（避免跨提交追加）
-                close_export_stream(safe_kw)
+            key = (safe_kw, scope if scope in ('single', 'all') else 'single')
+            if key in export_streams:
+                close_export_stream(safe_kw, scope=scope)
         except Exception:
             pass
 
         exports_dir = get_exports_dir()
         os.makedirs(exports_dir, exist_ok=True)
         today = datetime.datetime.now().strftime('%Y-%m-%d')
-        ts = int(time.time())
+        # 使用毫秒级时间戳，避免快速连续检索在同一秒产生相同文件名导致覆盖
+        ts = int(time.time() * 1000)
         # 区分文件名：all 模式稳定名，single 模式时间戳名
         if scope not in ('single', 'all'):
             scope = 'single'
@@ -102,9 +103,9 @@ def start_export_stream(safe_kw: str, scope: str = 'single'):
                     if item is None:
                         # 收到终止信号：在退出前尽可能排空队列，避免尾部数据丢失
                         try:
-                            drain_bulk = []
-                            drain_len = 0
-                            # 非阻塞地持续提取剩余项直到队列为空
+                            bulk_buf = []
+                            bulk_len = 0
+                            # 首先一次性排空当前队列（非阻塞）
                             while True:
                                 try:
                                     nxt = q.get_nowait()
@@ -118,20 +119,55 @@ def start_export_stream(safe_kw: str, scope: str = 'single'):
                                         nxt = str(nxt)
                                     except Exception:
                                         nxt = ''
-                                drain_bulk.append(nxt)
-                                drain_len += len(nxt)
-                                # 分批写入，避免一次性大字符串阻塞
-                                if drain_len >= int(EXPORT_WRITER_BATCH_MAX_BYTES) or len(drain_bulk) >= int(EXPORT_WRITER_BATCH_MAX_ITEMS):
+                                bulk_buf.append(nxt)
+                                bulk_len += len(nxt)
+                                if bulk_len >= int(EXPORT_WRITER_BATCH_MAX_BYTES) or len(bulk_buf) >= int(EXPORT_WRITER_BATCH_MAX_ITEMS):
                                     try:
-                                        fh.writelines(drain_bulk)
+                                        fh.writelines(bulk_buf)
                                     except Exception:
                                         pass
-                                    drain_bulk = []
-                                    drain_len = 0
-                            # 将最后一批剩余数据写盘
-                            if drain_bulk:
+                                    bulk_buf = []
+                                    bulk_len = 0
+                            # 继续以短超时阻塞提取，直到连续多次为空，确保捕获迟到的尾部项
+                            idle_checks = 0
+                            max_idle_checks = 10  # ~500ms 总空闲窗口
+                            while idle_checks < max_idle_checks:
                                 try:
-                                    fh.writelines(drain_bulk)
+                                    nxt = q.get(timeout=0.05)
+                                except Exception:
+                                    # 本轮无新项，写出累积并计数一次空闲
+                                    if bulk_buf:
+                                        try:
+                                            fh.writelines(bulk_buf)
+                                        except Exception:
+                                            pass
+                                        bulk_buf = []
+                                        bulk_len = 0
+                                    idle_checks += 1
+                                    continue
+                                # 收到新项或终止标记，重置空闲计数
+                                idle_checks = 0
+                                if nxt is None:
+                                    # 忽略重复终止标记
+                                    continue
+                                if not isinstance(nxt, str):
+                                    try:
+                                        nxt = str(nxt)
+                                    except Exception:
+                                        nxt = ''
+                                bulk_buf.append(nxt)
+                                bulk_len += len(nxt)
+                                if bulk_len >= int(EXPORT_WRITER_BATCH_MAX_BYTES) or len(bulk_buf) >= int(EXPORT_WRITER_BATCH_MAX_ITEMS):
+                                    try:
+                                        fh.writelines(bulk_buf)
+                                    except Exception:
+                                        pass
+                                    bulk_buf = []
+                                    bulk_len = 0
+                            # 写出最后残留
+                            if bulk_buf:
+                                try:
+                                    fh.writelines(bulk_buf)
                                 except Exception:
                                     pass
                         except Exception:
@@ -196,7 +232,7 @@ def start_export_stream(safe_kw: str, scope: str = 'single'):
 
         t = threading.Thread(target=_writer_loop, daemon=True)
         t.start()
-        export_streams[safe_kw] = {'fh': fh, 'path': filepath, 'queue': q, 'thread': t, 'scope': scope}
+        export_streams[(safe_kw, scope)] = {'fh': fh, 'path': filepath, 'queue': q, 'thread': t, 'scope': scope, 'closing': False}
         # 记录最近导出文件名（基于安全关键字与范围）
         try:
             latest_exports[(safe_kw, scope)] = filename
@@ -212,10 +248,13 @@ def append_export_text(safe_kw: str, text: str, scope: str = None):
     若未初始化则按给定 scope 创建；scope 为 None 时回退 'single'。
     """
     try:
-        info = export_streams.get(safe_kw)
+        key = (safe_kw, scope if scope in ('single', 'all') else 'single')
+        info = export_streams.get(key)
+        # 正在关闭期间：允许继续追加到现有队列以便写入线程在终止前排空，但禁止重启新流
         if not info or not info.get('queue'):
-            start_export_stream(safe_kw, scope=(scope if scope in ('single', 'all') else 'single'))
-            info = export_streams.get(safe_kw)
+            if not (info and info.get('closing')):
+                start_export_stream(safe_kw, scope=(scope if scope in ('single', 'all') else 'single'))
+                info = export_streams.get(key)
         q = info and info.get('queue')
         if not q:
             return
@@ -225,12 +264,18 @@ def append_export_text(safe_kw: str, text: str, scope: str = None):
         pass
 
 
-def close_export_stream(safe_kw: str):
-    """关闭指定关键字的导出流。"""
+def close_export_stream(safe_kw: str, scope: str = 'single'):
+    """关闭指定关键字在指定范围的导出流。"""
     try:
-        info = export_streams.pop(safe_kw, None)
+        key = (safe_kw, scope if scope in ('single', 'all') else 'single')
+        info = export_streams.get(key)
         if not info:
             return
+        # 标记为关闭中，阻止期间的重开与追加
+        try:
+            info['closing'] = True
+        except Exception:
+            pass
         q = info.get('queue')
         t = info.get('thread')
         # 发送终止标志，由写入线程负责排空并最终刷新；避免在关闭时丢失尚未写盘的数据
@@ -243,6 +288,11 @@ def close_export_stream(safe_kw: str):
         try:
             if t:
                 t.join()
+        except Exception:
+            pass
+        # 退出后再移除，避免在关闭期间 append 误判为不存在而重启新文件
+        try:
+            export_streams.pop(key, None)
         except Exception:
             pass
         # 句柄关闭由写入线程负责；此处不再二次关闭，避免竞态
@@ -258,9 +308,10 @@ def close_export_stream(safe_kw: str):
 def close_all_export_streams():
     """关闭所有导出流（用于取消或搜索结束清理）。"""
     try:
-        for safe_kw in list(export_streams.keys()):
+        for key in list(export_streams.keys()):
             try:
-                close_export_stream(safe_kw)
+                safe_kw, scope = key
+                close_export_stream(safe_kw, scope=scope)
             except Exception:
                 pass
         export_streams.clear()
