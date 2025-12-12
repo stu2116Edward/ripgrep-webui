@@ -1,5 +1,5 @@
 # 构建阶段（使用完整镜像）
-FROM python:3.9-alpine AS builder
+FROM python:3.12-alpine AS builder
 
 WORKDIR /app
 
@@ -39,17 +39,17 @@ RUN set -eux; \
     rg --version
 
 # 清理Python非必要内容并优化二进制体积
-RUN find /root/.local/lib/python3.9/site-packages -type d -name '__pycache__' -exec rm -rf {} + && \
-    find /root/.local/lib/python3.9/site-packages -type f -name '*.pyc' -delete && \
-    find /root/.local/lib/python3.9/site-packages -type d \( -name 'tests' -o -name 'test' -o -name 'testing' -o -name 'docs' -o -name '.pytest_cache' \) -exec rm -rf {} + && \
-    find /root/.local/lib/python3.9/site-packages -type f -name '*.so' -exec strip --strip-unneeded {} + || true
+RUN find /root/.local/lib/python3.12/site-packages -type d -name '__pycache__' -exec rm -rf {} + && \
+    find /root/.local/lib/python3.12/site-packages -type f -name '*.pyc' -delete && \
+    find /root/.local/lib/python3.12/site-packages -type d \( -name 'tests' -o -name 'test' -o -name 'testing' -o -name 'docs' -o -name '.pytest_cache' \) -exec rm -rf {} + && \
+    find /root/.local/lib/python3.12/site-packages -type f -name '*.so' -exec strip --strip-unneeded {} + || true
 
 # 清理构建依赖与临时缓存，减小镜像体积
 RUN apk del --purge .build-deps || apk del .build-deps; \
     rm -rf /root/.cache /tmp/* /var/cache/apk/*
 
 # 运行阶段（使用更小的基础镜像）
-FROM python:3.9-alpine
+FROM python:3.12-alpine
 
 WORKDIR /app
 
@@ -59,12 +59,12 @@ RUN apk add --no-cache \
     unzip
 
 # 从构建阶段仅复制必要的Python运行内容
-COPY --from=builder /root/.local/lib/python3.9/site-packages /root/.local/lib/python3.9/site-packages
+COPY --from=builder /root/.local/lib/python3.12/site-packages /root/.local/lib/python3.12/site-packages
 COPY --from=builder /root/.local/bin /root/.local/bin
 COPY --from=builder /usr/local/bin/rg /usr/bin/rg
 
 # 确保Python可以找到用户安装的包
-ENV PYTHONPATH=/root/.local/lib/python3.9/site-packages
+ENV PYTHONPATH=/root/.local/lib/python3.12/site-packages
 ENV PATH=/root/.local/bin:$PATH
 ENV PYTHONDONTWRITEBYTECODE=1
 
