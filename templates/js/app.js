@@ -639,10 +639,20 @@ socket.on('message', data => {
         wasCancelled = false;
         receivedChunks = 0;
         hasByteProgress = false;
-        matches = 0;
+        // 在“检索全部文件”模式下不重置累计匹配数，由外层循环维护
+        try {
+            const sel = document.getElementById('file');
+            const isAll = sel && sel.value === '__ALL__';
+            if (!isAll) {
+                matches = 0;
+                document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
+            }
+        } catch (e) {
+            matches = 0;
+            document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
+        }
         files_total = 0;
         files_done = 0;
-        document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
         setProgressState('running', {pct:0, text: '开始检索'});
         disableControls(true);
         document.getElementById('cancelBtn').disabled = false;
@@ -899,7 +909,10 @@ async function singleSearch(kw, before, after, file, scope, resetAll = false, fi
         
         // 等待搜索完成并获取匹配数（可被取消解阻）
         await new Promise(resolve => {
+            let finished = false;
             const onDone = () => {
+                if (finished) return;
+                finished = true;
                 cleanupSearchWaitListeners();
                 pendingSearchWaitResolve = null;
                 resolve();
@@ -907,9 +920,8 @@ async function singleSearch(kw, before, after, file, scope, resetAll = false, fi
             const handler = (data) => {
                 if (data && typeof data.message === 'string') {
                     const msg = data.message;
-                    // 非预览模式：仅在 Done/Cancelled/Error/Busy 时结束；不在 search_end 结束
-                    // 预览模式：保留原有行为，search_end 也可结束
-                    const allowSearchEnd = !!previewEnabled;
+                    // 计数模式（非预览）允许以 search_end 结束；预览模式仍以 Done 结束，避免尾部输出丢失
+                    const allowSearchEnd = !previewEnabled;
                     if (
                         msg.includes('Done') ||
                         msg.includes('Cancelled') ||
@@ -917,7 +929,8 @@ async function singleSearch(kw, before, after, file, scope, resetAll = false, fi
                         msg.includes('Error') ||
                         (allowSearchEnd && msg.includes('search_end'))
                     ) {
-                        onDone();
+                        // 延迟微任务执行，确保尾部 progress 事件（匹配数更新）先到达
+                        setTimeout(onDone, 0);
                     }
                 }
             };
@@ -925,8 +938,8 @@ async function singleSearch(kw, before, after, file, scope, resetAll = false, fi
                 if (typeof data.matches === 'number') {
                     currentFileMatches = data.matches;
                 }
-                // 非预览模式：不在 search_end 解阻；预览模式维持原行为
-                if (data && (data.phase === 'error' || data.phase === 'cancelled' || (previewEnabled && data.phase === 'search_end'))) {
+                // 预览模式不在 search_end 解阻；计数模式在 search_end 解阻以精确获取最终匹配数
+                if (data && ((data.phase === 'error') || (data.phase === 'cancelled') || (!previewEnabled && data.phase === 'search_end'))) {
                     onDone();
                 }
             };
@@ -1054,8 +1067,12 @@ function sendCloseBeacons() {
             const ping = new Blob(['1'], { type: 'text/plain' });
             // 先发取消，释放后端资源
             try { navigator.sendBeacon('/cancel', ping); } catch (e) {}
-            // 再发热重载，触发容器/进程级重启
-            try { navigator.sendBeacon('/hot-reload', ping); } catch (e) {}
+            // 仅在非检索进行时尝试热重载；检索进行中禁止触发，避免竞态
+            try {
+                if (!running && !pendingSubmit) {
+                    navigator.sendBeacon('/hot-reload', ping);
+                }
+            } catch (e) {}
         }
     } catch (e) {}
 }
