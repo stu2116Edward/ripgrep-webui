@@ -573,18 +573,12 @@ function updateExportLink() {
     const fileVal = fileSel ? (fileSel.value || '') : '';
     const a = document.getElementById('exportLink');
     if (!a) return;
-    // 关键词为空时不更新链接，避免误指向默认文件造成“数据丢失”的错觉
-    if (!kw) {
-        try { a.removeAttribute('href'); a.setAttribute('title', '请输入关键词后再下载'); } catch (e) {}
-        return;
-    }
-    const fallback = '/download?keyword=' + encodeURIComponent(kw) + '&file=' + encodeURIComponent(fileVal || '');
+    const fallback = '/download?keyword=' + encodeURIComponent(kw || 'search') + '&file=' + encodeURIComponent(fileVal || '');
     try {
-        trackedFetch('/export-info?keyword=' + encodeURIComponent(kw) + '&file=' + encodeURIComponent(fileVal || ''), {}, true)
+        trackedFetch('/export-info?keyword=' + encodeURIComponent(kw || 'search') + '&file=' + encodeURIComponent(fileVal || ''), {}, true)
             .then(r => r.ok ? r.json() : Promise.reject())
             .then(info => {
-                // 优先使用后端返回的直接下载链接（避免额外扫描与内存占用）
-                const href = (info && info.direct_download_url) ? info.direct_download_url : ((info && info.download_url) ? info.download_url : fallback);
+                const href = (info && info.download_url) ? info.download_url : fallback;
                 a.href = href;
                 try { a.setAttribute('download', ''); } catch (e) {}
             })
@@ -601,6 +595,7 @@ function updateExportLink() {
 function setupExportLink() {
     // 仅在取消或检索完成后由事件驱动更新，不绑定输入实时更新
 }
+
 
 // === Socket 消息处理 ===
 socket.on('message', data => {
