@@ -28,6 +28,9 @@ _proc_label_map = {}  # pid -> label 映射（当系统 rg 不支持 --label 时
 _restart_lock = threading.Lock()
 _restart_in_progress = False
 
+# 检索启动串行化锁：防止并发进入 start_search
+_search_lock = threading.Lock()
+
 
 def _close_streams(p):
     """尝试关闭进程可能打开的流。"""
@@ -148,13 +151,14 @@ def cancel():
             pass
     temp_dirs = []
 
-    # 关闭并清空导出流
+    # 由搜索线程的 finally 统一负责关闭导出流与释放 Busy，避免尾部写入在取消时被抢占
+    # 此处不主动关闭导出流，也不提前将 proc 置空，防止新检索在旧检索清理未完成时进入
     try:
-        close_all_export_streams()
+        pass
     except Exception:
         pass
 
-    proc = None
+    # 保持 proc 非空以指示 Busy；实际置空由搜索线程完成
     _proc_label_map = {}
     # 在返回前主动进行垃圾回收与进程工作集修剪，尽量立刻归还内存
     try:
@@ -182,7 +186,8 @@ def trigger_hot_reload_async():
 
     # 防止并发触发
     with _restart_lock:
-        if _restart_in_progress:
+        # 若已有重载进行中或当前存在活动搜索，拒绝触发
+        if _restart_in_progress or proc is not None:
             return False
         _restart_in_progress = True
 
