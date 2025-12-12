@@ -6,6 +6,7 @@
 """
 
 import os
+from datetime import datetime
 from flask import (
     Blueprint, render_template, request, jsonify,
     send_from_directory, abort, current_app
@@ -16,7 +17,7 @@ from utils import emit_message_utf, sanitize_keyword
 from search_engine import start_search
 from process_manager import cancel as cancel_search
 from process_manager import trigger_hot_reload_async
-from export_manager import get_exports_dir
+from export_manager import get_exports_dir, get_latest_export_filename
 
 routes_bp = Blueprint('routes_bp', __name__)
 
@@ -196,8 +197,22 @@ def download():
     exports_dir = get_exports_dir()
     # 'all' 模式文件名已改为时间戳格式：<safe>__all_<YYYY-MM-DD>_<ts>.txt
 
-    # 单次扫描选择最新文件，避免构建/排序大列表导致内存增长
-    if not os.path.isdir(exports_dir):
+    candidates = []
+    try:
+        if os.path.isdir(exports_dir):
+            # 兼容旧命名：带 scope 的文件名前缀 <safe>__<scope>_
+            prefix = f"{safe}__{scope}_"
+            for fn in os.listdir(exports_dir):
+                if fn.startswith(prefix):
+                    candidates.append(fn)
+            # 若未找到，回退到仅关键字前缀
+            if not candidates:
+                for fn in os.listdir(exports_dir):
+                    if fn.startswith(safe):
+                        candidates.append(fn)
+    except Exception:
+        candidates = []
+    if not candidates:
         abort(404)
 
     # 如果提供了 stamp=MM-DD_ts，尝试精确匹配该文件
@@ -220,54 +235,20 @@ def download():
             return ''
 
     chosen = None
-    prefix = f"{safe}__{scope}_"
-    best_prefix_fn = None
-    best_prefix_mtime = -1.0
-    best_any_fn = None
-    best_any_mtime = -1.0
-    try:
-        for de in os.scandir(exports_dir):
+    if stamp and len(stamp) >= 8:
+        # 基于传入的 MM-DD_ts 精确定位
+        for fn in candidates:
             try:
-                if not de.is_file():
-                    continue
-                fn = de.name
-                # 优先匹配带 scope 的前缀
-                if fn.startswith(prefix):
-                    # 若指定了 stamp 且命中，则直接选择
-                    if not chosen and stamp and len(stamp) >= 8:
-                        try:
-                            if _stamp_of(fn) == stamp:
-                                chosen = fn
-                                break
-                        except Exception:
-                            pass
-                    # 否则记录最新的 mtime
-                    try:
-                        mt = de.stat().st_mtime
-                        if mt > best_prefix_mtime:
-                            best_prefix_mtime = mt
-                            best_prefix_fn = fn
-                    except Exception:
-                        pass
-                # 记录仅关键字前缀的最新项（作为回退）
-                elif fn.startswith(safe):
-                    try:
-                        mt = de.stat().st_mtime
-                        if mt > best_any_mtime:
-                            best_any_mtime = mt
-                            best_any_fn = fn
-                    except Exception:
-                        pass
+                if _stamp_of(fn) == stamp:
+                    chosen = fn
+                    break
             except Exception:
-                continue
-    except Exception:
-        pass
-
+                pass
     if not chosen:
-        chosen = best_prefix_fn or best_any_fn
-    if not chosen:
-        abort(404)
-    return send_from_directory(exports_dir, chosen, as_attachment=True, conditional=True)
+        # 未指定或未匹配到，选择最新
+        candidates.sort(key=lambda n: os.path.getmtime(os.path.join(exports_dir, n)), reverse=True)
+        chosen = candidates[0]
+    return send_from_directory(exports_dir, chosen, as_attachment=True)
 
 
 @routes_bp.route('/export-info')
@@ -285,33 +266,19 @@ def export_info():
     safe = sanitize_keyword(keyword)
     exports_dir = get_exports_dir()
 
-    # 单次扫描选择最新文件，避免构建/排序大列表导致内存增长
-    if not os.path.isdir(exports_dir):
-        return jsonify({"exists": False}), 404
-    prefix = f"{safe}__{scope}_"
-    latest = None
-    latest_mtime = -1.0
+    candidates = []
     try:
-        for de in os.scandir(exports_dir):
-            try:
-                if not de.is_file():
-                    continue
-                fn = de.name
-                if not fn.startswith(prefix):
-                    continue
-                try:
-                    mt = de.stat().st_mtime
-                    if mt > latest_mtime:
-                        latest_mtime = mt
-                        latest = fn
-                except Exception:
-                    pass
-            except Exception:
-                continue
+        if os.path.isdir(exports_dir):
+            prefix = f"{safe}__{scope}_"
+            for fn in os.listdir(exports_dir):
+                if fn.startswith(prefix):
+                    candidates.append(fn)
     except Exception:
-        pass
-    if not latest:
+        candidates = []
+    if not candidates:
         return jsonify({"exists": False}), 404
+    candidates.sort(key=lambda n: os.path.getmtime(os.path.join(exports_dir, n)), reverse=True)
+    latest = candidates[0]
 
     # 提取 MM-DD_ts
     def _stamp_of(fn: str) -> str:
@@ -330,11 +297,9 @@ def export_info():
             return ''
     stamp = _stamp_of(latest)
     dl_url = f"/download?keyword={safe}&file={'__ALL__' if scope=='all' else ''}&stamp={stamp}" if stamp else f"/download?keyword={safe}&file={'__ALL__' if scope=='all' else ''}"
-    direct_url = f"/exports/{latest}"
     return jsonify({
         "exists": True,
         "filename": latest,
         "stamp": stamp,
-        "download_url": dl_url,
-        "direct_download_url": direct_url
+        "download_url": dl_url
     })
