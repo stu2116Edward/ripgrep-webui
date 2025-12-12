@@ -58,13 +58,18 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
     """
     启动搜索：复用原始流程与细节，返回字符串状态（'Started' 或错误字符串）。
     """
-    # 只有在没有搜索正在进行时才继续
-    if pm.proc is not None:
-        try:
-            emit_message_utf('Busy\n')
-        except Exception:
-            pass
-        return "Busy"
+    # 使用启动锁与原子 Busy 标记，确保串行检索
+    try:
+        with pm._search_lock:
+            if pm.proc is not None:
+                try:
+                    emit_message_utf('Busy\n')
+                except Exception:
+                    pass
+                return "Busy"
+            pm.proc = 'starting'
+    except Exception:
+        pass
 
     # 在开始新搜索时重置取消标志，并进行一次轻量内存修剪
     pm.cancel_requested = False
@@ -85,6 +90,10 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
     # 确认 rg 可用
     if not has_cmd('rg'):
         emit_message_utf('ripgrep 未安装或不可用，请在系统 PATH 中提供 rg。')
+        try:
+            pm.proc = None
+        except Exception:
+            pass
         return "rg not found"
 
     # 预创建/管理导出写入流
@@ -96,7 +105,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
         if scope == 'all':
             if reset_all:
                 try:
-                    close_export_stream(safe_kw_init)
+                    close_export_stream(safe_kw_init, scope='all')
                 except Exception:
                     pass
                 start_export_stream(safe_kw_init, scope='all')
@@ -830,10 +839,11 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                 emit_message_utf('没有可搜索的文件或内容。\n')
             except Exception:
                 pass
-            pm.proc = None
             try:
-                if scope == 'single' or (scope == 'all' and final_all):
-                    close_export_stream(sanitize_keyword(keyword))
+                if scope == 'single':
+                    close_export_stream(sanitize_keyword(keyword), scope='single')
+                elif scope == 'all' and final_all:
+                    close_export_stream(sanitize_keyword(keyword), scope='all')
             except Exception:
                 pass
             try:
@@ -844,6 +854,8 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                 pm._proc_label_map.clear()
             except Exception:
                 pass
+            # 在关闭导出流与清理完成后再释放 Busy 标志
+            pm.proc = None
             return "Started"
 
         # 标记主进程（用于 /cancel 检测）
@@ -889,12 +901,14 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                         except queue.Empty:
                             if pm.cancel_requested:
                                 break
-                            all_ended = True
+                            # 仅当所有 RG 读取线程已发出 EOF、所有附加进程结束且队列为空时再退出，避免前向线程尚未入队尾部数据即提前结束
+                            all_extra_ended = True
                             for p in extra_procs_local:
                                 if p.poll() is None:
-                                    all_ended = False
+                                    all_extra_ended = False
                                     break
-                            if all_ended and q.empty():
+                            rg_all_eof = (len(eof_set) >= total_procs)
+                            if rg_all_eof and all_extra_ended and q.empty():
                                 break
                             # 周期性发送进度
                             try:
@@ -1159,6 +1173,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                                     elapsed_ms=elapsed_ms,
                                     files_total=total_files,
                                     files_done=files_done,
+                                    matches=match_count,
                                     label=label_text
                                 )
                             except Exception:
@@ -1208,19 +1223,7 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                         elapsed_ms_total = 0
                     emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
             finally:
-                # 最终清理：额外进程、临时目录、导出流、主进程标记
-                try:
-                    for p in extra_procs_local:
-                        try:
-                            if p.poll() is None:
-                                try:
-                                    pm._terminate_proc(p)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                # 最终清理：临时目录、导出流、主进程标记
                 try:
                     for d in list(pm.temp_dirs):
                         try:
@@ -1234,26 +1237,50 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                     pm._proc_label_map.clear()
                 except Exception:
                     pass
-                pm.proc = None
-                try:
-                    if (scope == 'single' or (scope == 'all' and final_all)):
-                        close_export_stream(sanitize_keyword(keyword))
-                except Exception:
-                    pass
                 # 清理可能累积的全局附加进程引用
                 try:
                     pm.extra_procs.clear()
                 except Exception:
                     pass
-                # 等待前向读取线程结束
+                # 等待前向读取线程结束：更稳健地等待直至退出，避免尾部数据未入队
                 try:
                     for t in forward_threads_local:
                         try:
-                            t.join(timeout=0.5)
+                            total_wait = 0.0
+                            # 最多等待约2秒，分步加入，确保读取线程已完全结束
+                            while getattr(t, 'is_alive', lambda: False)() and total_wait < 2.0:
+                                try:
+                                    t.join(timeout=0.1)
+                                except Exception:
+                                    pass
+                                total_wait += 0.1
                         except Exception:
                             pass
                 except Exception:
                     pass
+                # 所有前向线程均结束后再关闭导出流，避免尾部数据在关闭后仍写入
+                try:
+                    if scope == 'single':
+                        close_export_stream(sanitize_keyword(keyword), scope='single')
+                    elif scope == 'all' and final_all:
+                        close_export_stream(sanitize_keyword(keyword), scope='all')
+                except Exception:
+                    pass
+                # 在所有前向读取线程结束并关闭导出流后，再终止额外进程，避免过早终止导致尾部数据未读出
+                try:
+                    for p in extra_procs_local:
+                        try:
+                            if p.poll() is None:
+                                try:
+                                    pm._terminate_proc(p)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                # 所有资源清理完毕后再释放 Busy 信号（proc 置空），避免新检索过早进入导致竞态
+                pm.proc = None
 
                 # 主动排空内部队列，避免残留大对象占用内存
                 try:
@@ -1370,17 +1397,33 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                         pass
             except Exception:
                 pass
+            # 先终止并清理额外进程，避免遗留数据竞争导出流
+            try:
+                for p in extra_procs_local:
+                    try:
+                        if p.poll() is None:
+                            try:
+                                pm._terminate_proc(p)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             extra_procs_local = []
-            pm.proc = None
             try:
                 pm.extra_procs.clear()
             except Exception:
                 pass
             try:
-                if scope == 'single' or (scope == 'all' and final_all):
-                    close_export_stream(sanitize_keyword(keyword))
+                if scope == 'single':
+                    close_export_stream(sanitize_keyword(keyword), scope='single')
+                elif scope == 'all' and final_all:
+                    close_export_stream(sanitize_keyword(keyword), scope='all')
             except Exception:
                 pass
+            # 保证导出流关闭完毕后再释放 Busy 标志
+            pm.proc = None
             return "Error"
 
         return "Started"
@@ -1417,15 +1460,31 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
                     pass
         except Exception:
             pass
+        # 先终止并清理额外进程，避免遗留数据竞争导出流
+        try:
+            for p in extra_procs_local:
+                try:
+                    if p.poll() is None:
+                        try:
+                            pm._terminate_proc(p)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
         extra_procs_local = []
-        pm.proc = None
         try:
             pm.extra_procs.clear()
         except Exception:
             pass
         try:
-            if scope == 'single' or (scope == 'all' and final_all):
-                close_export_stream(sanitize_keyword(keyword))
+            if scope == 'single':
+                close_export_stream(sanitize_keyword(keyword), scope='single')
+            elif scope == 'all' and final_all:
+                close_export_stream(sanitize_keyword(keyword), scope='all')
         except Exception:
             pass
+        # 保证导出流关闭完毕后再释放 Busy 标志
+        pm.proc = None
         return "Error"
