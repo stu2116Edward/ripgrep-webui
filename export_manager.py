@@ -22,6 +22,9 @@ from config import (
 export_streams = {}
 _EXPORTS_DIR = '/app/exports'
 
+# 记录每个关键字与范围（scope）最近创建的导出文件名，避免后续扫描目录
+latest_exports = {}
+
 
 def get_exports_dir():
     """统一导出目录选择：容器优先使用 /app/exports，本地环境回退到项目内 exports 目录。"""
@@ -194,6 +197,11 @@ def start_export_stream(safe_kw: str, scope: str = 'single'):
         t = threading.Thread(target=_writer_loop, daemon=True)
         t.start()
         export_streams[safe_kw] = {'fh': fh, 'path': filepath, 'queue': q, 'thread': t, 'scope': scope}
+        # 记录最近导出文件名（基于安全关键字与范围）
+        try:
+            latest_exports[(safe_kw, scope)] = filename
+        except Exception:
+            pass
         return filepath
     except Exception:
         return None
@@ -262,3 +270,13 @@ def close_all_export_streams():
             pass
     except Exception:
         pass
+
+
+def get_latest_export_filename(safe_kw: str, scope: str = 'single') -> str:
+    """返回最近的导出文件名（不含路径），不存在则返回 None。"""
+    try:
+        key = (safe_kw, scope if scope in ('single', 'all') else 'single')
+        fn = latest_exports.get(key)
+        return fn
+    except Exception:
+        return None
