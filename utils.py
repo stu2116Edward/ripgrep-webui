@@ -204,3 +204,157 @@ def trim_process_memory():
                 pass
     except Exception:
         pass
+
+
+def drop_file_cache_fd(fd: int):
+    """
+    尝试丢弃指定文件描述符的页面缓存（Linux：posix_fadvise DONTNEED）。
+    - 仅在类 Unix 环境下有效；Windows 跳过。
+    - 失败时静默忽略。
+    """
+    try:
+        if os.name == 'nt':
+            return
+        try:
+            libc = ctypes.CDLL('libc.so.6')
+        except Exception:
+            return
+        POSIX_FADV_DONTNEED = 4
+        try:
+            libc.posix_fadvise(ctypes.c_int(fd), ctypes.c_long(0), ctypes.c_long(0), ctypes.c_int(POSIX_FADV_DONTNEED))
+        except Exception:
+            try:
+                libc.posix_fadvise64(ctypes.c_int(fd), ctypes.c_long(0), ctypes.c_long(0), ctypes.c_int(POSIX_FADV_DONTNEED))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def drop_file_cache_range(fd: int, offset: int, length: int):
+    """
+    丢弃指定文件描述符在给定范围 [offset, offset+length) 的页面缓存。
+    - 仅类 Unix 环境有效；Windows 跳过。
+    - offset/length 需为非负且 length>0。
+    """
+    try:
+        if os.name == 'nt':
+            return
+        if offset is None or length is None:
+            return
+        if offset < 0 or length <= 0:
+            return
+        try:
+            libc = ctypes.CDLL('libc.so.6')
+        except Exception:
+            return
+        POSIX_FADV_DONTNEED = 4
+        # 优先使用 64 位版本，处理超大文件偏移
+        try:
+            libc.posix_fadvise64(ctypes.c_int(fd), ctypes.c_longlong(offset), ctypes.c_longlong(length), ctypes.c_int(POSIX_FADV_DONTNEED))
+        except Exception:
+            try:
+                libc.posix_fadvise(ctypes.c_int(fd), ctypes.c_long(offset), ctypes.c_long(length), ctypes.c_int(POSIX_FADV_DONTNEED))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def set_file_access_noreuse_fd(fd: int):
+    """
+    为给定文件描述符设置访问建议为 NOREUSE（不复用），提示内核尽快丢弃已用页面。
+    - 仅类 Unix 环境有效；Windows 跳过。
+    """
+    try:
+        if os.name == 'nt':
+            return
+        try:
+            libc = ctypes.CDLL('libc.so.6')
+        except Exception:
+            return
+        POSIX_FADV_NOREUSE = 5
+        try:
+            libc.posix_fadvise(ctypes.c_int(fd), ctypes.c_long(0), ctypes.c_long(0), ctypes.c_int(POSIX_FADV_NOREUSE))
+        except Exception:
+            try:
+                libc.posix_fadvise64(ctypes.c_int(fd), ctypes.c_long(0), ctypes.c_long(0), ctypes.c_int(POSIX_FADV_NOREUSE))
+            except Exception:
+                pass
+    except Exception:
+        pass
+def drop_file_cache_path(path: str):
+    """
+    尝试丢弃指定路径文件的页面缓存（打开只读后调用 fadvise DONTNEED）。
+    - 仅在类 Unix 环境下有效；Windows 跳过。
+    - 失败时静默忽略。
+    """
+    try:
+        if os.name == 'nt':
+            return
+        fd = None
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except Exception:
+            fd = None
+        if fd is None:
+            return
+        try:
+            drop_file_cache_fd(fd)
+        finally:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def aggressive_memory_reclaim():
+    """
+    在容器等环境下进行更强的内存回收尝试：
+    - 多次 gc.collect 与 malloc_trim，尽可能归还未使用堆内存
+    - 尝试 sync 并写入 /proc/sys/vm/drop_caches（需要权限，失败则忽略）
+    - Windows 下重复压缩工作集
+    """
+    try:
+        try:
+            gc.collect()
+            gc.collect()
+        except Exception:
+            pass
+
+        if os.name == 'nt':
+            try:
+                hproc = ctypes.windll.kernel32.GetCurrentProcess()
+                ctypes.windll.psapi.EmptyWorkingSet(hproc)
+                ctypes.windll.psapi.EmptyWorkingSet(hproc)
+            except Exception:
+                pass
+            return
+
+        # Unix/Linux: malloc_trim + 尝试 drop_caches
+        try:
+            libc = ctypes.CDLL('libc.so.6')
+            try:
+                libc.malloc_trim(0)
+                libc.malloc_trim(0)
+            except Exception:
+                pass
+            # 同步文件系统缓冲，提升丢弃页面缓存的成功率
+            try:
+                libc.sync()
+            except Exception:
+                pass
+        except Exception:
+            libc = None
+
+        # 尝试系统级丢弃缓存（可能需要 CAP_SYS_ADMIN，失败则忽略）
+        try:
+            with open('/proc/sys/vm/drop_caches', 'w') as f:
+                # 3 = pagecache + dentries + inodes
+                f.write('3\n')
+        except Exception:
+            pass
+    except Exception:
+        pass
