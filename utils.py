@@ -12,7 +12,6 @@ import gc
 import ctypes
 
 from config import (
-    STREAM_CHUNK_SIZE,
     SINGLE_COMPRESSED_EXTS, ARCHIVE_EXTS, EXCEL_EXTS, CSV_EXTS, TEXT_EXTS
 )
 
