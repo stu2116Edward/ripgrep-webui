@@ -6,14 +6,24 @@
 """
 
 import time
+import os
 import json
 import gc
 
 from utils import (
     get_app, emit_message_utf, emit_progress_ex, sanitize_keyword, classify_file_type,
-    trim_process_memory,
+    trim_process_memory, aggressive_memory_reclaim, drop_file_cache_path,
 )
-from export_manager import append_export_text, close_export_stream
+from config import (
+    NON_PREVIEW_LIGHT_TRIM_INTERVAL_MS,
+    NON_PREVIEW_AGGRESSIVE_TRIM_INTERVAL_MS,
+    SCAN_FILE_CACHE_DROP_INTERVAL_MS,
+    SEARCH_FINAL_RECLAIM_ENABLED,
+    FINAL_AGGRESSIVE_RECLAIM_REPEATS,
+    FINAL_AGGRESSIVE_RECLAIM_SLEEP_MS,
+    SEARCH_FINAL_DROP_EXPORT_CACHE_ENABLED,
+)
+from export_manager import append_export_text, close_export_stream, get_exports_dir, get_latest_export_filename
 import process_manager as pm
 
 
@@ -66,6 +76,12 @@ def run_output_loop(
             first_block = True
             search_start_ns = {}
             last_progress_tick_ns = 0
+            # 非预览模式下的周期性轻量内存修剪节流
+            last_trim_tick_ns = 0
+            # 非预览模式下的周期性“增强回收”节流（含 drop_caches 尝试），避免过于频繁
+            last_aggressive_tick_ns = 0
+            # 针对当前正在检索的文件，按 owner 记录页面缓存丢弃的节流时间
+            last_cache_drop_ns_map = {}
             owner_current_label = {}
             owner_has_output = {}
 
@@ -103,6 +119,42 @@ def run_output_loop(
                             elapsed_ms_total = int((now_ns - request_start_ns) / 1_000_000)
                             emit_progress_ex(matches=match_count, files_total=total_files, files_done=files_done, elapsed_ms=elapsed_ms_total)
                             last_progress_tick_ns = now_ns
+                        # 在非预览（仅计数）模式中，根据配置节流执行轻量与增强回收，避免内存攀升
+                        if count_only:
+                            light_trim_interval_ns = max(0, int(NON_PREVIEW_LIGHT_TRIM_INTERVAL_MS)) * 1_000_000
+                            if light_trim_interval_ns > 0 and (last_trim_tick_ns == 0 or (now_ns - last_trim_tick_ns) >= light_trim_interval_ns):
+                                try:
+                                    gc.collect()
+                                except Exception:
+                                    pass
+                                try:
+                                    trim_process_memory()
+                                except Exception:
+                                    pass
+                                last_trim_tick_ns = now_ns
+                            # 周期性进行一次增强回收（包含 drop_caches 尝试），在容器中更有效
+                            aggressive_interval_ns = max(0, int(NON_PREVIEW_AGGRESSIVE_TRIM_INTERVAL_MS)) * 1_000_000
+                            if aggressive_interval_ns > 0 and (last_aggressive_tick_ns == 0 or (now_ns - last_aggressive_tick_ns) >= aggressive_interval_ns):
+                                try:
+                                    aggressive_memory_reclaim()
+                                except Exception:
+                                    pass
+                                last_aggressive_tick_ns = now_ns
+                            # 定期丢弃当前检索中文件的页面缓存，抑制大文件 page cache
+                            try:
+                                for owner_id, label_text in list(owner_current_label.items()):
+                                    if not label_text:
+                                        continue
+                                    last_ns = last_cache_drop_ns_map.get(owner_id, 0)
+                                    drop_interval_ns = max(0, int(SCAN_FILE_CACHE_DROP_INTERVAL_MS)) * 1_000_000
+                                    if drop_interval_ns > 0 and (last_ns == 0 or (now_ns - last_ns) >= drop_interval_ns):
+                                        try:
+                                            drop_file_cache_path(label_text)
+                                        except Exception:
+                                            pass
+                                        last_cache_drop_ns_map[owner_id] = now_ns
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                     continue
@@ -373,6 +425,10 @@ def run_output_loop(
                         except Exception:
                             pass
                         try:
+                            last_cache_drop_ns_map.pop(owner, None)
+                        except Exception:
+                            pass
+                        try:
                             owner_has_output.pop(owner, None)
                         except Exception:
                             pass
@@ -446,6 +502,20 @@ def run_output_loop(
                 close_export_stream(sanitize_keyword(keyword), scope='all')
         except Exception:
             pass
+        # 在导出流关闭后尝试丢弃导出文件的页面缓存（可配置），降低容器 page cache
+        try:
+            if SEARCH_FINAL_DROP_EXPORT_CACHE_ENABLED:
+                exports_dir = get_exports_dir()
+                if scope == 'single':
+                    fn = get_latest_export_filename(sanitize_keyword(keyword), scope='single')
+                    if fn:
+                        drop_file_cache_path(os.path.join(exports_dir, fn))
+                elif scope == 'all' and final_all:
+                    fn = get_latest_export_filename(sanitize_keyword(keyword), scope='all')
+                    if fn:
+                        drop_file_cache_path(os.path.join(exports_dir, fn))
+        except Exception:
+            pass
         # 在关闭导出后再终止额外进程
         try:
             for p in extra_procs_local:
@@ -494,6 +564,31 @@ def run_output_loop(
             trim_process_memory()
         except Exception:
             pass
+        # 容器环境下执行更强的回收尝试：按配置重复与休眠
+        try:
+            if SEARCH_FINAL_RECLAIM_ENABLED:
+                repeats = max(1, int(FINAL_AGGRESSIVE_RECLAIM_REPEATS))
+                sleep_ms = max(0, int(FINAL_AGGRESSIVE_RECLAIM_SLEEP_MS))
+                for _ in range(repeats):
+                    try:
+                        aggressive_memory_reclaim()
+                    except Exception:
+                        pass
+                    try:
+                        if sleep_ms > 0:
+                            time.sleep(sleep_ms / 1000.0)
+                    except Exception:
+                        pass
+                    try:
+                        gc.collect()
+                    except Exception:
+                        pass
+                    try:
+                        trim_process_memory()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
         try:
             elapsed_ms_total = int((time.perf_counter_ns() - request_start_ns) / 1_000_000)
@@ -504,8 +599,15 @@ def run_output_loop(
         except Exception:
             pass
 
+        # 可配置的休眠已在上面的循环中进行；此处无需固定等待
+
+        # 再次进行一次轻量修剪，确保完成后工作集回落到基线
         try:
-            time.sleep(0.5)
+            gc.collect()
+        except Exception:
+            pass
+        try:
+            trim_process_memory()
         except Exception:
             pass
 
