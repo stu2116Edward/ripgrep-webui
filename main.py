@@ -30,6 +30,11 @@ from routes import routes_bp
 
 # 创建 Flask 应用（模板目录默认即为 'templates'）
 app = Flask(__name__, template_folder='templates')
+# # 启用 X-Sendfile：由前置服务器（若支持）直接发送文件，避免 Python 进程内存占用
+# try:
+#     app.config['USE_X_SENDFILE'] = True
+# except Exception:
+#     pass
 
 # 创建 Socket.IO（与前端保持一致的 path 与心跳参数）
 socketio = SocketIO(
