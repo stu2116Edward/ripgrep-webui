@@ -28,6 +28,9 @@ _proc_label_map = {}  # pid -> label 映射（当系统 rg 不支持 --label 时
 _restart_lock = threading.Lock()
 _restart_in_progress = False
 
+# 检索启动串行化锁：防止并发进入 start_search
+_search_lock = threading.Lock()
+
 
 def _close_streams(p):
     """尝试关闭进程可能打开的流。"""
@@ -114,6 +117,76 @@ def _terminate_proc(p, kill_group=True):
             pass
 
 
+def terminate_proc(p, kill_group=True):
+    """
+    公开的进程终止包装：供其他模块调用，避免直接依赖私有函数。
+    """
+    try:
+        _terminate_proc(p, kill_group=kill_group)
+    except Exception:
+        pass
+
+
+def cleanup_temp_dirs():
+    """
+    统一清理并移除已登记的临时目录，供取消、热重载与检索收尾使用。
+    """
+    global temp_dirs
+    try:
+        for d in list(temp_dirs):
+            try:
+                shutil.rmtree(d)
+            except Exception:
+                pass
+        temp_dirs = []
+    except Exception:
+        pass
+
+
+def schedule_temp_dir_cleanup_for_proc(proc, temp_dir):
+    """
+    为进程退出后安排异步删除临时目录的任务。
+    - 等待关联进程退出后删除目录并从登记列表移除。
+    - 失败时在可确定进程已结束的情况下立即删除。
+    """
+    def _cleanup(p=proc, d=temp_dir):
+        try:
+            if hasattr(p, 'wait'):
+                p.wait()
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(d)
+        except Exception:
+            pass
+        try:
+            if d in temp_dirs:
+                temp_dirs.remove(d)
+        except Exception:
+            pass
+        try:
+            gc.collect()
+        except Exception:
+            pass
+    try:
+        t = threading.Thread(target=_cleanup, daemon=True)
+        t.start()
+    except Exception:
+        try:
+            if proc and getattr(proc, 'poll', lambda: None)() is not None:
+                try:
+                    shutil.rmtree(temp_dir)
+                except Exception:
+                    pass
+                try:
+                    if temp_dir in temp_dirs:
+                        temp_dirs.remove(temp_dir)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
 def cancel():
     """
     取消当前搜索，终止所有子进程并清理资源。返回 (result_dict, http_code) 以供路由直接返回。
@@ -140,21 +213,20 @@ def cancel():
     except Exception:
         pass
 
-    # 清理临时目录
-    for d in list(temp_dirs):
-        try:
-            shutil.rmtree(d)
-        except Exception:
-            pass
-    temp_dirs = []
-
-    # 关闭并清空导出流
+    # 清理临时目录（统一调用）
     try:
-        close_all_export_streams()
+        cleanup_temp_dirs()
     except Exception:
         pass
 
-    proc = None
+    # 由搜索线程的 finally 统一负责关闭导出流与释放 Busy，避免尾部写入在取消时被抢占
+    # 此处不主动关闭导出流，也不提前将 proc 置空，防止新检索在旧检索清理未完成时进入
+    try:
+        pass
+    except Exception:
+        pass
+
+    # 保持 proc 非空以指示 Busy；实际置空由搜索线程完成
     _proc_label_map = {}
     # 在返回前主动进行垃圾回收与进程工作集修剪，尽量立刻归还内存
     try:
@@ -182,7 +254,8 @@ def trigger_hot_reload_async():
 
     # 防止并发触发
     with _restart_lock:
-        if _restart_in_progress:
+        # 若已有重载进行中或当前存在活动搜索，拒绝触发
+        if _restart_in_progress or proc is not None:
             return False
         _restart_in_progress = True
 
@@ -202,13 +275,11 @@ def trigger_hot_reload_async():
     except Exception:
         pass
 
-    # 清理临时目录
-    for d in list(temp_dirs):
-        try:
-            shutil.rmtree(d)
-        except Exception:
-            pass
-    temp_dirs = []
+    # 清理临时目录（统一调用）
+    try:
+        cleanup_temp_dirs()
+    except Exception:
+        pass
 
     # 关闭导出流
     try:
