@@ -16,11 +16,14 @@ from config import (
     EXPORT_WRITER_BATCH_MAX_ITEMS,
     EXPORT_WRITER_BATCH_MAX_BYTES,
     EXPORT_WRITER_FLUSH_INTERVAL_MS,
+    EXPORTS_DIR,
+    EXPORT_CLOSE_RECLAIM_ENABLED,
 )
+from utils import drop_file_cache_fd, drop_file_cache_path, trim_process_memory, aggressive_memory_reclaim
 
 # 后台导出文件的流式写入句柄（按安全化后的关键字区分）
 export_streams = {}
-_EXPORTS_DIR = '/app/exports'
+_EXPORTS_DIR = EXPORTS_DIR
 
 # 记录每个关键字与范围（scope）最近创建的导出文件名，避免后续扫描目录
 latest_exports = {}
@@ -97,6 +100,7 @@ def start_export_stream(safe_kw: str, scope: str = 'single'):
 
         def _writer_loop():
             last_flush_ns = time.perf_counter_ns()
+            last_fadvise_ns = last_flush_ns
             try:
                 while True:
                     item = q.get()
@@ -206,11 +210,19 @@ def start_export_stream(safe_kw: str, scope: str = 'single'):
                         fh.writelines(bulk)
                         # 周期性刷新（如果启用）
                         try:
+                            now_ns = time.perf_counter_ns()
                             if EXPORT_WRITER_FLUSH_INTERVAL_MS and EXPORT_WRITER_FLUSH_INTERVAL_MS > 0:
-                                now_ns = time.perf_counter_ns()
                                 if (now_ns - last_flush_ns) >= int(EXPORT_WRITER_FLUSH_INTERVAL_MS) * 1_000_000:
                                     fh.flush()
                                     last_flush_ns = now_ns
+                            # 周期性丢弃导出文件的页面缓存，降低容器内 page cache 积累（可配置间隔）
+                            fadvise_interval_ns = max(0, int(EXPORT_WRITER_FADVISE_INTERVAL_MS)) * 1_000_000
+                            if fadvise_interval_ns > 0 and (now_ns - last_fadvise_ns) >= fadvise_interval_ns:
+                                try:
+                                    drop_file_cache_fd(fh.fileno())
+                                except Exception:
+                                    pass
+                                last_fadvise_ns = now_ns
                         except Exception:
                             pass
                     except Exception:
@@ -221,6 +233,11 @@ def start_export_stream(safe_kw: str, scope: str = 'single'):
                     fh.flush()
                     try:
                         os.fsync(fh.fileno())
+                    except Exception:
+                        pass
+                    # 在关闭前尝试丢弃该文件的页面缓存，降低容器内 page cache 占用
+                    try:
+                        drop_file_cache_fd(fh.fileno())
                     except Exception:
                         pass
                 except Exception:
@@ -288,6 +305,29 @@ def close_export_stream(safe_kw: str, scope: str = 'single'):
         try:
             if t:
                 t.join()
+        except Exception:
+            pass
+        # 写入线程已退出：如启用则对导出文件进行按路径丢缓存，并执行内存回收
+        try:
+            if EXPORT_CLOSE_RECLAIM_ENABLED:
+                path = info.get('path')
+                if path:
+                    try:
+                        drop_file_cache_path(path)
+                    except Exception:
+                        pass
+                try:
+                    gc.collect()
+                except Exception:
+                    pass
+                try:
+                    trim_process_memory()
+                except Exception:
+                    pass
+                try:
+                    aggressive_memory_reclaim()
+                except Exception:
+                    pass
         except Exception:
             pass
         # 退出后再移除，避免在关闭期间 append 误判为不存在而重启新文件
