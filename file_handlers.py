@@ -172,21 +172,26 @@ def build_decompress_command(path_lower, real_path):
 
 
 def list_7z_members(archive_path):
-    """返回 7z 列表的成员信息（name,size），size 可能为 None。"""
-    items = []
+    """逐行解析 7z 列表输出，按需产生成员信息（name, size）。"""
     if not has_cmd('7z'):
-        return items
+        return []
     try:
-        p = subprocess.run(['7z', 'l', '-slt', archive_path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
-        out_lines = p.stdout.decode('utf-8', errors='replace').splitlines()
+        proc = subprocess.Popen(
+            ['7z', 'l', '-slt', archive_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            creationflags=popen_creationflags()
+        )
         current_path = None
         current_type = None
         current_size = None
-        for line in out_lines:
-            s = line.strip()
+        # 逐行读取，避免一次性加载到内存
+        for raw_line in iter(proc.stdout.readline, b''):
+            s = raw_line.decode('utf-8', errors='replace').strip()
             if not s:
                 if current_path and (not current_type or current_type.lower() == 'file'):
-                    items.append({'name': current_path, 'size': (int(current_size) if current_size and current_size.isdigit() else None)})
+                    yield {'name': current_path, 'size': (int(current_size) if current_size and current_size.isdigit() else None)}
                 current_path = None
                 current_type = None
                 current_size = None
@@ -197,11 +202,13 @@ def list_7z_members(archive_path):
                 current_type = s[7:]
             elif s.startswith('Size = '):
                 current_size = s[7:]
+        # 文件末尾可能没有空行分隔，处理最后一个条目
         if current_path and (not current_type or current_type.lower() == 'file'):
-            items.append({'name': current_path, 'size': (int(current_size) if current_size and current_size.isdigit() else None)})
+            yield {'name': current_path, 'size': (int(current_size) if current_size and current_size.isdigit() else None)}
+        proc.wait()
     except Exception:
-        pass
-    return items
+        # 出错时返回空可迭代对象
+        return []
 
 
 def safe_extract_tar(tar, path):
@@ -471,22 +478,8 @@ def copy_fileobj_chunked(src, dst, chunk_size: int = STREAM_CHUNK_SIZE, progress
             except BrokenPipeError:
                 break
     except Exception:
-        try:
-            data = src.read()
-            if not pm.cancel_requested and data:
-                try:
-                    dst.write(data)
-                    done += len(data)
-                    if progress_cb:
-                        elapsed_ms = int((time.perf_counter_ns() - start_ns) / 1_000_000)
-                        try:
-                            progress_cb(done, bytes_total, elapsed_ms)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        # 读异常时不尝试整文件回读，直接终止以避免内存峰值
+        pass
     try:
         if hasattr(dst, 'flush'):
             dst.flush()
