@@ -1,16 +1,17 @@
 # 构建阶段（使用完整镜像）
-FROM python:3.9-slim AS builder
+FROM python:3.9-alpine AS builder
 
 WORKDIR /app
 
-# 安装构建依赖（Debian/Ubuntu）
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
+# 安装构建依赖
+RUN apk add --no-cache --virtual .build-deps \
+    gcc \
+    musl-dev \
+    linux-headers \
     binutils \
+    libffi-dev \
     curl \
-    ca-certificates \
-    tar \
- && rm -rf /var/lib/apt/lists/*
+    tar
 
 # 复制 requirements.txt
 COPY requirements.txt .
@@ -18,12 +19,12 @@ COPY requirements.txt .
 # 安装Python包（禁用字节码编译以减小体积）
 RUN pip install --user --no-cache-dir --no-compile -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# 获取最新 ripgrep rg（根据构建平台选择 glibc 版本），仅在构建阶段执行
+# 获取最新 ripgrep rg（根据构建平台选择 musl 版本），仅在构建阶段执行
 ARG TARGETPLATFORM
 RUN set -eux; \
     case "$TARGETPLATFORM" in \
-      "linux/amd64") RG_ARCH="x86_64-unknown-linux-gnu" ;; \
-      "linux/arm64") RG_ARCH="aarch64-unknown-linux-gnu" ;; \
+      "linux/amd64") RG_ARCH="x86_64-unknown-linux-musl" ;; \
+      "linux/arm64") RG_ARCH="aarch64-unknown-linux-musl" ;; \
       *) echo "Unsupported TARGETPLATFORM: $TARGETPLATFORM"; exit 1 ;; \
     esac; \
     RG_URL=$(curl -s https://api.github.com/repos/BurntSushi/ripgrep/releases/latest \
@@ -36,6 +37,7 @@ RUN set -eux; \
     tar -xzf /tmp/rg.tar.gz -C /tmp/rgdl; \
     mv /tmp/rgdl/ripgrep-*/rg /usr/local/bin/rg; \
     chmod +x /usr/local/bin/rg; \
+    strip --strip-unneeded /usr/local/bin/rg || true; \
     rg --version
 
 # 清理Python非必要内容并优化二进制体积
@@ -44,19 +46,19 @@ RUN find /root/.local/lib/python3.9/site-packages -type d -name '__pycache__' -e
     find /root/.local/lib/python3.9/site-packages -type d \( -name 'tests' -o -name 'test' -o -name 'testing' -o -name 'docs' -o -name '.pytest_cache' \) -exec rm -rf {} + && \
     find /root/.local/lib/python3.9/site-packages -type f -name '*.so' -exec strip --strip-unneeded {} + || true
 
-# 清理构建缓存
-RUN rm -rf /root/.cache /tmp/* /var/cache/*
+# 清理构建依赖与临时缓存，减小镜像体积
+RUN apk del --purge .build-deps || apk del .build-deps; \
+    rm -rf /root/.cache /tmp/* /var/cache/apk/*
 
 # 运行阶段（使用更小的基础镜像）
-FROM python:3.9-slim
+FROM python:3.9-alpine
 
 WORKDIR /app
 
-# 安装运行时依赖（Debian/Ubuntu 系）
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    p7zip-full \
-    unzip \
- && rm -rf /var/lib/apt/lists/*
+# 安装运行时依赖
+RUN apk add --no-cache \
+    p7zip \
+    unzip
 
 # 从构建阶段仅复制必要的Python运行内容
 COPY --from=builder /root/.local/lib/python3.9/site-packages /root/.local/lib/python3.9/site-packages
@@ -72,16 +74,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 RUN mkdir -p templates exports
 
 # 复制应用代码
-COPY main.py .
-COPY config.py .
-COPY routes.py .
-COPY feed.py .
-COPY utils.py .
-COPY file_handlers.py .
-COPY search_engine.py .
-COPY output_loop.py .
-COPY process_manager.py .
-COPY export_manager.py .
+COPY *.py ./
 COPY templates/ ./templates/
 
 # 设置环境变量
