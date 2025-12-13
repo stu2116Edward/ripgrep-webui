@@ -13,10 +13,14 @@ import tempfile
 import threading
 import subprocess
 
-from config import STREAM_CHUNK_SIZE, EXCEL_EXTS, CSV_EXTS
+from config import (
+    STREAM_CHUNK_SIZE, EXCEL_EXTS, CSV_EXTS,
+    FILE_READ_CACHE_DROP_STRIDE_BYTES, FILE_READ_CACHE_KEEP_TAIL_BYTES,
+    FILE_READ_SET_NOREUSE
+)
 from utils import (
     has_cmd, popen_creationflags, emit_message_utf, emit_progress_ex,
-    is_excel_file, is_csv_file
+    is_excel_file, is_csv_file, drop_file_cache_range, set_file_access_noreuse_fd
 )
 import process_manager as pm
 
@@ -449,7 +453,22 @@ def copy_fileobj_chunked(src, dst, chunk_size: int = STREAM_CHUNK_SIZE, progress
     """
     start_ns = time.perf_counter_ns()
     done = 0
+    # 针对源文件的页面缓存控制：设置不复用建议，并进行范围丢弃（可调）
+    src_fd = None
+    last_drop_to = 0
+    keep_tail_bytes = int(FILE_READ_CACHE_KEEP_TAIL_BYTES) if FILE_READ_CACHE_KEEP_TAIL_BYTES else (4 * 1024 * 1024)
+    drop_stride_bytes = int(FILE_READ_CACHE_DROP_STRIDE_BYTES) if FILE_READ_CACHE_DROP_STRIDE_BYTES else (64 * 1024 * 1024)
     try:
+        try:
+            if hasattr(src, 'fileno'):
+                src_fd = src.fileno()
+                if FILE_READ_SET_NOREUSE:
+                    try:
+                        set_file_access_noreuse_fd(src_fd)
+                    except Exception:
+                        pass
+        except Exception:
+            src_fd = None
         while True:
             if pm.cancel_requested:
                 try:
@@ -469,6 +488,19 @@ def copy_fileobj_chunked(src, dst, chunk_size: int = STREAM_CHUNK_SIZE, progress
             try:
                 dst.write(chunk)
                 done += len(chunk)
+                # 精确范围丢弃：对已读旧页按步长丢弃，抑制 page cache 累积
+                if src_fd is not None and drop_stride_bytes and drop_stride_bytes > 0:
+                    try:
+                        drop_to_target = max(0, done - keep_tail_bytes)
+                        drop_len = drop_to_target - last_drop_to
+                        if drop_len >= drop_stride_bytes:
+                            try:
+                                drop_file_cache_range(src_fd, last_drop_to, drop_len)
+                            except Exception:
+                                pass
+                            last_drop_to += drop_len
+                    except Exception:
+                        pass
                 if progress_cb:
                     elapsed_ms = int((time.perf_counter_ns() - start_ns) / 1_000_000)
                     try:
