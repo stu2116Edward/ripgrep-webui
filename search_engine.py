@@ -10,7 +10,10 @@ import time
 import queue
 import threading
 
-from config import DEFAULT_DATA_DIR, TEXT_EXTS, SEARCH_RG_QUEUE_MAXSIZE
+from config import (
+    DEFAULT_DATA_DIR, TEXT_EXTS, SEARCH_RG_QUEUE_MAXSIZE,
+    RG_NO_MMAP_IN_COUNT_MODE, RG_LINE_BUFFERED_IN_COUNT_MODE,
+)
 from utils import (
     get_socketio, emit_message_utf, has_cmd,
     sanitize_keyword,
@@ -55,6 +58,16 @@ def start_search(keyword: str, context_before: int, context_after: int, file: st
 
     # 基本 rg 参数
     rg_base = ['rg', '-uuu', '--smart-case', '--json']
+    # 非预览模式下根据配置禁用 mmap/启用行缓冲，减少内存压力与缓冲堆积
+    try:
+        if bool(count_only):
+            if RG_NO_MMAP_IN_COUNT_MODE:
+                rg_base.append('--no-mmap')
+            # 尽可能采用行缓冲，降低长时间缓冲导致的堆积
+            if RG_LINE_BUFFERED_IN_COUNT_MODE:
+                rg_base.append('--line-buffered')
+    except Exception:
+        pass
 
     # 确认 rg 可用
     if not has_cmd('rg'):
