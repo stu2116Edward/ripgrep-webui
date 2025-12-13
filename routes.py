@@ -6,6 +6,7 @@
 """
 
 import os
+from datetime import datetime
 from flask import (
     Blueprint, render_template, request, jsonify,
     send_from_directory, abort, current_app
@@ -16,7 +17,7 @@ from utils import emit_message_utf, sanitize_keyword
 from search_engine import start_search
 from process_manager import cancel as cancel_search
 from process_manager import trigger_hot_reload_async
-from export_manager import get_exports_dir
+from export_manager import get_exports_dir, get_latest_export_filename
 
 routes_bp = Blueprint('routes_bp', __name__)
 
@@ -41,6 +42,16 @@ def serve_js(filename):
     try:
         base = os.path.join(os.path.dirname(__file__), 'templates', 'js')
         return send_from_directory(base, filename)
+    except Exception:
+        abort(404)
+
+
+@routes_bp.route('/exports/<path:filename>')
+def serve_export_file(filename):
+    """直接提供导出文件的下载（避免额外目录扫描与内存占用）。"""
+    try:
+        exports_dir = get_exports_dir()
+        return send_from_directory(exports_dir, filename, as_attachment=True, conditional=True)
     except Exception:
         abort(404)
 
@@ -93,6 +104,47 @@ def route_search():
     final_all = bool(data.get('final_all') or False)
 
     status = start_search(keyword=keyword, context_before=before, context_after=after, file=file, scope_override=scope, reset_all=reset_all, final_all=final_all)
+
+    if status == "Started":
+        try:
+            emit_message_utf('Started\n')
+        except Exception:
+            pass
+        return "Started", 200
+    elif status == "Busy":
+        return "Busy", 200
+    elif status == "rg not found":
+        return "rg not found", 500
+    else:
+        return "Error", 500
+
+
+@routes_bp.route('/search-count', methods=['POST'])
+def route_search_count():
+    """
+    启动仅计数检索（非预览模式）：
+    - 统计匹配次数并发送进度
+    - 参数：keyword, file；可选 scope/reset_all/final_all
+    """
+    data = request.json or {}
+    keyword = (data.get('keyword') or '').strip()
+    if not keyword:
+        return "Missing keyword", 400
+    try:
+        before = int(data.get('context_before', 0) or 0)
+    except Exception:
+        before = 0
+    try:
+        after = int(data.get('context_after', 0) or 0)
+    except Exception:
+        after = 0
+    file = (data.get('file') or '').strip()
+    scope = (data.get('scope') or '').strip()
+    scope = (scope if scope in ('all', 'single') else None)
+    reset_all = bool(data.get('reset_all') or False)
+    final_all = bool(data.get('final_all') or False)
+
+    status = start_search(keyword=keyword, context_before=before, context_after=after, file=file, scope_override=scope, reset_all=reset_all, final_all=final_all, count_only=True)
 
     if status == "Started":
         try:
