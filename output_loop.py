@@ -22,6 +22,7 @@ from config import (
     FINAL_AGGRESSIVE_RECLAIM_REPEATS,
     FINAL_AGGRESSIVE_RECLAIM_SLEEP_MS,
     SEARCH_FINAL_DROP_EXPORT_CACHE_ENABLED,
+    SEARCH_FINAL_DROP_SCANNED_FILE_CACHE_ENABLED,
 )
 from export_manager import append_export_text, close_export_stream, get_exports_dir, get_latest_export_filename
 import process_manager as pm
@@ -61,6 +62,7 @@ def run_output_loop(
     safe_kw = sanitize_keyword(keyword)
     match_count = 0
     files_done = 0
+    seen_paths = set()
 
     try:
         with get_app().app_context():
@@ -76,7 +78,7 @@ def run_output_loop(
             first_block = True
             search_start_ns = {}
             last_progress_tick_ns = 0
-            # 非预览模式下的周期性轻量内存修剪节流
+            # 页面缓存丢弃节流标记（预览与非预览均适用）
             last_trim_tick_ns = 0
             # 非预览模式下的周期性“增强回收”节流（含 drop_caches 尝试），避免过于频繁
             last_aggressive_tick_ns = 0
@@ -140,21 +142,21 @@ def run_output_loop(
                                 except Exception:
                                     pass
                                 last_aggressive_tick_ns = now_ns
-                            # 定期丢弃当前检索中文件的页面缓存，抑制大文件 page cache
-                            try:
-                                for owner_id, label_text in list(owner_current_label.items()):
-                                    if not label_text:
-                                        continue
-                                    last_ns = last_cache_drop_ns_map.get(owner_id, 0)
-                                    drop_interval_ns = max(0, int(SCAN_FILE_CACHE_DROP_INTERVAL_MS)) * 1_000_000
-                                    if drop_interval_ns > 0 and (last_ns == 0 or (now_ns - last_ns) >= drop_interval_ns):
-                                        try:
-                                            drop_file_cache_path(label_text)
-                                        except Exception:
-                                            pass
-                                        last_cache_drop_ns_map[owner_id] = now_ns
-                            except Exception:
-                                pass
+                        # 预览与非预览模式均定期丢弃当前检索中文件的页面缓存，抑制大文件 page cache
+                        try:
+                            for owner_id, label_text in list(owner_current_label.items()):
+                                if not label_text:
+                                    continue
+                                last_ns = last_cache_drop_ns_map.get(owner_id, 0)
+                                drop_interval_ns = max(0, int(SCAN_FILE_CACHE_DROP_INTERVAL_MS)) * 1_000_000
+                                if drop_interval_ns > 0 and (last_ns == 0 or (now_ns - last_ns) >= drop_interval_ns):
+                                    try:
+                                        drop_file_cache_path(label_text)
+                                    except Exception:
+                                        pass
+                                    last_cache_drop_ns_map[owner_id] = now_ns
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                     continue
@@ -199,6 +201,12 @@ def run_output_loop(
                         label_text = pm._proc_label_map.get(owner)
                     if label_text:
                         owner_current_label[owner] = label_text
+                        try:
+                            lt = str(label_text).strip()
+                            if lt and lt.lower() != '<stdin>':
+                                seen_paths.add(os.path.abspath(lt))
+                        except Exception:
+                            pass
                         try:
                             if str(label_text).strip().lower() != '<stdin>':
                                 append_export_text(safe_kw, f"[{label_text}]\n", scope=scope)
@@ -470,6 +478,16 @@ def run_output_loop(
             pm.cleanup_temp_dirs()
         except Exception:
             pass
+        # 在检索最终阶段，尝试丢弃本次已扫描文件的页面缓存，以降低容器 page cache
+        try:
+            if SEARCH_FINAL_DROP_SCANNED_FILE_CACHE_ENABLED:
+                for p in list(seen_paths):
+                    try:
+                        drop_file_cache_path(p)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         try:
             pm._proc_label_map.clear()
         except Exception:
@@ -502,7 +520,7 @@ def run_output_loop(
                 close_export_stream(sanitize_keyword(keyword), scope='all')
         except Exception:
             pass
-        # 在导出流关闭后尝试丢弃导出文件的页面缓存（可配置），降低容器 page cache
+        # 在导出流关闭或会话完成后尝试丢弃导出文件的页面缓存（可配置），降低容器 page cache
         try:
             if SEARCH_FINAL_DROP_EXPORT_CACHE_ENABLED:
                 exports_dir = get_exports_dir()
@@ -510,7 +528,8 @@ def run_output_loop(
                     fn = get_latest_export_filename(sanitize_keyword(keyword), scope='single')
                     if fn:
                         drop_file_cache_path(os.path.join(exports_dir, fn))
-                elif scope == 'all' and final_all:
+                elif scope == 'all':
+                    # 即使复用会话（final_all=False），也在本次会话结束后丢弃页面缓存
                     fn = get_latest_export_filename(sanitize_keyword(keyword), scope='all')
                     if fn:
                         drop_file_cache_path(os.path.join(exports_dir, fn))
