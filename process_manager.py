@@ -14,8 +14,13 @@ import threading
 import subprocess
 import gc
 
-from utils import emit_message_utf, emit_progress_ex, trim_process_memory
-from export_manager import close_all_export_streams
+from utils import emit_message_utf, emit_progress_ex, trim_process_memory, aggressive_memory_reclaim
+from export_manager import close_all_export_streams, has_active_export_streams
+from config import (
+    IDLE_RECLAIM_ENABLED,
+    IDLE_LIGHT_TRIM_INTERVAL_MS,
+    IDLE_AGGRESSIVE_TRIM_INTERVAL_MS,
+)
 
 # 全局状态
 proc = None  # 当前主 rg 进程或代表主流程的进程
@@ -30,6 +35,88 @@ _restart_in_progress = False
 
 # 检索启动串行化锁：防止并发进入 start_search
 _search_lock = threading.Lock()
+
+# 空闲内存回收线程控制
+_idle_thread = None
+_idle_thread_lock = threading.Lock()
+
+
+def _idle_reclaimer_loop():
+    """后台空闲内存回收线程：在完全空闲时周期性执行轻量与增强回收。
+    条件：无主流程（proc 为 None）、无附加进程、无活跃导出写入线程、未处于取消流程。
+    """
+    last_light_ns = 0
+    last_aggressive_ns = 0
+    light_ns = max(0, int(IDLE_LIGHT_TRIM_INTERVAL_MS)) * 1_000_000
+    aggressive_ns = max(0, int(IDLE_AGGRESSIVE_TRIM_INTERVAL_MS)) * 1_000_000
+    while True:
+        try:
+            if not IDLE_RECLAIM_ENABLED:
+                # 若禁用则短眠，避免忙等
+                time.sleep(1.0)
+                continue
+            # 仅在完全空闲时尝试回收
+            idle = (proc is None) and (not extra_procs) and (not cancel_requested)
+            try:
+                if idle:
+                    # 若存在活跃的导出写入线程（含关闭中），视为非空闲
+                    if has_active_export_streams():
+                        idle = False
+                else:
+                    # 非空闲状态：重置计时器，避免立即触发回收
+                    last_light_ns = time.perf_counter_ns()
+                    last_aggressive_ns = last_light_ns
+            except Exception:
+                # 保守处理：出现异常时不做强回收
+                idle = False
+
+            now_ns = time.perf_counter_ns()
+            if idle:
+                # 轻量修剪（gc + 工作集压缩/trim），较为安全可频繁执行
+                if light_ns > 0 and (last_light_ns == 0 or (now_ns - last_light_ns) >= light_ns):
+                    try:
+                        gc.collect()
+                    except Exception:
+                        pass
+                    try:
+                        trim_process_memory()
+                    except Exception:
+                        pass
+                    last_light_ns = now_ns
+                # 增强回收（可能尝试 drop_caches），间隔更长以避免影响系统缓存
+                if aggressive_ns > 0 and (last_aggressive_ns == 0 or (now_ns - last_aggressive_ns) >= aggressive_ns):
+                    try:
+                        aggressive_memory_reclaim()
+                    except Exception:
+                        pass
+                    last_aggressive_ns = now_ns
+                # 空闲时短眠，避免忙等
+                time.sleep(0.5)
+            else:
+                # 非空闲时更长时间休眠，降低负载
+                time.sleep(1.0)
+        except Exception:
+            # 任何异常下继续循环，保持线程存活
+            try:
+                time.sleep(1.0)
+            except Exception:
+                pass
+
+
+def _ensure_idle_reclaimer_started():
+    """确保空闲回收线程已启动（一次性）。"""
+    global _idle_thread
+    try:
+        with _idle_thread_lock:
+            if _idle_thread is None:
+                t = threading.Thread(target=_idle_reclaimer_loop, daemon=True)
+                t.start()
+                _idle_thread = t
+    except Exception:
+        pass
+
+# 模块导入时启动空闲回收线程
+_ensure_idle_reclaimer_started()
 
 
 def _close_streams(p):
