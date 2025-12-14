@@ -18,6 +18,8 @@ from config import (
     EXPORT_WRITER_FLUSH_INTERVAL_MS,
     EXPORTS_DIR,
     EXPORT_CLOSE_RECLAIM_ENABLED,
+    EXPORT_CLOSE_AGGRESSIVE_RECLAIM_REPEATS,
+    EXPORT_CLOSE_AGGRESSIVE_RECLAIM_SLEEP_MS,
 )
 from utils import drop_file_cache_fd, drop_file_cache_path, trim_process_memory, aggressive_memory_reclaim
 
@@ -307,7 +309,7 @@ def close_export_stream(safe_kw: str, scope: str = 'single'):
                 t.join()
         except Exception:
             pass
-        # 写入线程已退出：如启用则对导出文件进行按路径丢缓存，并执行内存回收
+        # 写入线程已退出：如启用则对导出文件进行按路径丢缓存，并执行多轮内存回收
         try:
             if EXPORT_CLOSE_RECLAIM_ENABLED:
                 path = info.get('path')
@@ -316,18 +318,33 @@ def close_export_stream(safe_kw: str, scope: str = 'single'):
                         drop_file_cache_path(path)
                     except Exception:
                         pass
+                # 多轮强回收：结合 gc/malloc_trim/drop_caches 与适度休眠
                 try:
-                    gc.collect()
+                    repeats = max(1, int(EXPORT_CLOSE_AGGRESSIVE_RECLAIM_REPEATS))
                 except Exception:
-                    pass
+                    repeats = 1
                 try:
-                    trim_process_memory()
+                    sleep_ms = max(0, int(EXPORT_CLOSE_AGGRESSIVE_RECLAIM_SLEEP_MS))
                 except Exception:
-                    pass
-                try:
-                    aggressive_memory_reclaim()
-                except Exception:
-                    pass
+                    sleep_ms = 0
+                for _ in range(repeats):
+                    try:
+                        gc.collect()
+                    except Exception:
+                        pass
+                    try:
+                        trim_process_memory()
+                    except Exception:
+                        pass
+                    try:
+                        aggressive_memory_reclaim()
+                    except Exception:
+                        pass
+                    if sleep_ms > 0:
+                        try:
+                            time.sleep(sleep_ms / 1000.0)
+                        except Exception:
+                            pass
         except Exception:
             pass
         # 退出后再移除，避免在关闭期间 append 误判为不存在而重启新文件
@@ -371,3 +388,22 @@ def get_latest_export_filename(safe_kw: str, scope: str = 'single') -> str:
         return fn
     except Exception:
         return None
+
+
+def has_active_export_streams() -> bool:
+    """是否存在活跃的导出写入流（用于空闲内存回收的判定）。
+    只要后台写入线程仍存活，即视为活跃；关闭中的流也视为活跃直至线程退出。
+    """
+    try:
+        for info in list(export_streams.values()):
+            try:
+                t = info.get('thread')
+                if t and getattr(t, 'is_alive', lambda: False)():
+                    return True
+            except Exception:
+                # 保守判定：异常时视为活跃，避免在关闭中误触发强回收
+                return True
+        return False
+    except Exception:
+        # 出错时保守返回 True，避免误判空闲
+        return True
