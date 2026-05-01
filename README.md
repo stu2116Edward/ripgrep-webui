@@ -17,6 +17,7 @@ curl -sS -O https://gitee.com/stu2116Edward/docker-tools/raw/master/docker_tools
 - 创建文件存储目录：
 ```bash
 mkdir -p /data/kuzi
+cd /data/kuzi
 ```
 - 使用Docker命令部署
 ```bash
