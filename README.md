@@ -9,6 +9,10 @@ Visual Text Content Retrieval Tool
 ## Docker
 ### 安装Docker环境
 使用脚本自行安装
+```
+curl -sS -O https://raw.githubusercontent.com/stu2116Edward/my-sh/refs/heads/main/docker_tools.sh && chmod +x docker_tools.sh && ./docker_tools.sh
+```
+镜像加速
 ```bash
 curl -sS -O https://gitee.com/stu2116Edward/docker-tools/raw/master/docker_tools.sh && chmod +x docker_tools.sh && ./docker_tools.sh
 ```
