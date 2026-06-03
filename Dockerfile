@@ -9,6 +9,7 @@ RUN apk add --no-cache --virtual .build-deps \
     musl-dev \
     linux-headers \
     binutils \
+    libffi-dev \
     curl \
     tar
 
@@ -36,6 +37,7 @@ RUN set -eux; \
     tar -xzf /tmp/rg.tar.gz -C /tmp/rgdl; \
     mv /tmp/rgdl/ripgrep-*/rg /usr/local/bin/rg; \
     chmod +x /usr/local/bin/rg; \
+    strip --strip-unneeded /usr/local/bin/rg || true; \
     rg --version
 
 # 清理Python非必要内容并优化二进制体积
@@ -72,15 +74,10 @@ ENV PYTHONDONTWRITEBYTECODE=1
 RUN mkdir -p templates exports
 
 # 复制应用代码
-COPY main.py .
-COPY config.py .
-COPY routes.py .
-COPY utils.py .
-COPY file_handlers.py .
-COPY search_engine.py .
-COPY process_manager.py .
-COPY export_manager.py .
+COPY *.py ./
+COPY handlers/ ./handlers/
 COPY templates/ ./templates/
+
 
 # 设置环境变量
 ENV GUNICORN_CMD_ARGS="-w 1 -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker"
