@@ -277,7 +277,9 @@ let receivedChunks = 0;
 let matches = 0;
 let files_total = 0;
 let files_done = 0;
-let progressHideTimeout = null;
+    let progressHideTimeout = null;
+    // 在全文件串行检索中，单文件完成后为缓存与内存回收预留的等待时间
+    const INTER_FILE_RECLAIM_DELAY_MS = 2000;
 // 多文件检索间隔定时器，取消时需清理
 let interFileDelayTimer = null;
 let fileType = 'other';
@@ -291,6 +293,8 @@ let hasByteProgress = false;
 let lastSearchAll = false;
 // 标记是否已点击“清空”按钮，用于导出按钮仅提示
 let clearedAfterSearch = false;
+// 在“检索全部文件”模式下，保存前面文件的累计匹配数，供实时显示使用
+let searchAllBaseMatches = 0;
 
 // 挂起的检索等待与监听引用，用于在取消时主动清理，避免内存泄漏
 let pendingSearchWaitResolve = null;
@@ -708,9 +712,12 @@ socket.on('progress', data => {
     if (wasCancelled && (!data || data.phase !== 'cancelled')) {
         return;
     }
-    // 只在单文件检索时更新匹配数，多文件检索时由sendKeyword函数控制
-    if (typeof data.matches === 'number' && document.getElementById('file').value !== '__ALL__') {
-        matches = data.matches;
+    // 实时更新匹配数：
+    // - 单文件检索：直接显示当前文件匹配数
+    // - 全文件检索：显示（已完成文件累计匹配数 + 当前文件实时匹配数）
+    if (typeof data.matches === 'number') {
+        const isSearchAll = (document.getElementById('file').value === '__ALL__');
+        matches = isSearchAll ? (searchAllBaseMatches + data.matches) : data.matches;
         document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
     }
     if (typeof data.files_total === 'number') files_total = data.files_total;
@@ -842,6 +849,8 @@ async function sendKeyword() {
             if (wasCancelled) break;
             const isFirst = (i === 0);
             const isLast = (i === list.length - 1);
+            // 记录此前累计匹配数，供当前文件进度事件实时显示总匹配数
+            searchAllBaseMatches = totalMatches;
             const fileMatches = await singleSearch(kw, before, after, f, 'all', isFirst, isLast);
             if (typeof fileMatches === 'number') {
                 totalMatches += fileMatches;
@@ -849,14 +858,16 @@ async function sendKeyword() {
                 document.getElementById('matchDisplay').textContent = `匹配：${matches} 条`;
             }
             
-            // 在进行下一个文件检索前添加1秒缓冲时间
+            // 在进行下一个文件检索前，预留缓存清空/内存回收时间
             if (i < list.length - 1 && !wasCancelled) {
                 await new Promise(resolve => {
                     try { interFileDelayTimer && clearTimeout(interFileDelayTimer); } catch (e) {}
+                    // 显示缓存清理状态，确保用户知晓当前处于等待阶段
+                    try { setProgressState('running', { pct: 100, text: '缓存清理中…', file: f }); } catch (e) {}
                     interFileDelayTimer = setTimeout(function(){
                         interFileDelayTimer = null;
                         resolve();
-                    }, 1000);
+                    }, INTER_FILE_RECLAIM_DELAY_MS);
                 });
             }
         }
