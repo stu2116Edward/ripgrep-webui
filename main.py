@@ -14,8 +14,18 @@ monkey.patch_all()
 import os
 import signal
 import sys
+import logging
 from flask import Flask
 from flask_socketio import SocketIO
+
+# 配置日志：在控制台输出 INFO 级别及以上日志，便于后台观察运行状态
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    stream=sys.stdout,
+)
+logger = logging.getLogger(__name__)
+
 
 from config import (
     CORS_ALLOWED_ORIGINS,
@@ -25,7 +35,8 @@ from config import (
     SOCKETIO_PING_INTERVAL,
 )
 from utils import init_app, emit_message_utf
-from process_manager import trigger_hot_reload_async
+from process import trigger_hot_reload_async
+
 from routes import routes_bp
 
 # 创建 Flask 应用（模板目录默认即为 'templates'）
@@ -48,13 +59,16 @@ socketio = SocketIO(
 
 # 注册路由 Blueprint
 app.register_blueprint(routes_bp)
+logger.info('Routes registered')
 
 # 注入 app/socketio 上下文到工具模块，供各子模块统一取用
 init_app(app, socketio)
+logger.info('App and SocketIO context injected')
 
 
 @socketio.on('connect')
 def _on_connect():
+    logger.info('Socket.IO client connected')
     # 简短确认信息；使用 try/except 保持稳定性
     try:
         emit_message_utf('Connected\n')
@@ -64,6 +78,7 @@ def _on_connect():
 
 @socketio.on('disconnect')
 def _on_disconnect():
+    logger.info('Socket.IO client disconnected')
     # 断连时通知并尝试触发热重载（页面刷新时有用）
     try:
         emit_message_utf('Disconnected\n')
@@ -73,12 +88,14 @@ def _on_disconnect():
     try:
         enable = os.environ.get('HOT_RELOAD_ON_DISCONNECT', '')
         if str(enable).strip().lower() in ('1', 'true', 'yes', 'y', 'on'):
+            logger.info('Hot reload triggered on disconnect')
             trigger_hot_reload_async()
     except Exception:
         pass
 
 
 def _graceful_shutdown(signum, frame):
+    logger.info(f'Received signal {signum}, initiating graceful shutdown')
     # 在容器或本地运行时，优雅地触发一次热重载/退出（便于 docker-compose 重启）
     try:
         trigger_hot_reload_async()
@@ -94,12 +111,11 @@ def _graceful_shutdown(signum, frame):
 try:
     signal.signal(signal.SIGTERM, _graceful_shutdown)
     signal.signal(signal.SIGINT, _graceful_shutdown)
+    logger.info('Signal handlers registered for SIGTERM and SIGINT')
 except Exception:
     pass
 
 
 if __name__ == '__main__':
-    # 生产环境
-    socketio.run(app, host='0.0.0.0', port=5000)
-    # 测试环境
-    # socketio.run(app, host='0.0.0.0', port=5000, debug=True, use_reloader=False)
+    logger.info('Starting Socket.IO server on 0.0.0.0:5000 (debug mode)')
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True, use_reloader=False)
