@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-导出逻辑模块
+导出管理模块
 - 管理导出文件目录与流式写入
 - 以关键字（安全化）为粒度进行独立的后台写盘
 """
@@ -16,11 +16,18 @@ from config import (
     EXPORT_WRITER_BATCH_MAX_ITEMS,
     EXPORT_WRITER_BATCH_MAX_BYTES,
     EXPORT_WRITER_FLUSH_INTERVAL_MS,
+    EXPORT_WRITER_FADVISE_INTERVAL_MS,
+    EXPORTS_DIR,
+    EXPORT_CLOSE_RECLAIM_ENABLED,
+    EXPORT_CLOSE_AGGRESSIVE_RECLAIM_REPEATS,
+    EXPORT_CLOSE_AGGRESSIVE_RECLAIM_SLEEP_MS,
 )
+
+from utils import drop_file_cache_fd, drop_file_cache_path, trim_process_memory, aggressive_memory_reclaim
 
 # 后台导出文件的流式写入句柄（按安全化后的关键字区分）
 export_streams = {}
-_EXPORTS_DIR = '/app/exports'
+_EXPORTS_DIR = EXPORTS_DIR
 
 # 记录每个关键字与范围（scope）最近创建的导出文件名，避免后续扫描目录
 latest_exports = {}
@@ -79,8 +86,8 @@ def start_export_stream(safe_kw: str, scope: str = 'single'):
         exports_dir = get_exports_dir()
         os.makedirs(exports_dir, exist_ok=True)
         today = datetime.datetime.now().strftime('%Y-%m-%d')
-        # 使用毫秒级时间戳，避免快速连续检索在同一秒产生相同文件名导致覆盖
-        ts = int(time.time() * 1000)
+        # 使用提交时的具体时间 HH-MM-SS 作为时间戳，直观可读
+        ts = datetime.datetime.now().strftime('%H-%M-%S')
         # 区分文件名：all 模式稳定名，single 模式时间戳名
         if scope not in ('single', 'all'):
             scope = 'single'
@@ -88,6 +95,7 @@ def start_export_stream(safe_kw: str, scope: str = 'single'):
             filename = f"{safe_kw}__all_{today}_{ts}.txt"
         else:
             filename = f"{safe_kw}__single_{today}_{ts}.txt"
+
         filepath = os.path.join(exports_dir, filename)
         # all 采用追加模式，single 采用覆盖模式；使用较大缓冲与错误替换提升吞吐与稳健性
         mode = 'a' if scope == 'all' else 'w'
@@ -97,6 +105,7 @@ def start_export_stream(safe_kw: str, scope: str = 'single'):
 
         def _writer_loop():
             last_flush_ns = time.perf_counter_ns()
+            last_fadvise_ns = last_flush_ns
             try:
                 while True:
                     item = q.get()
@@ -206,11 +215,19 @@ def start_export_stream(safe_kw: str, scope: str = 'single'):
                         fh.writelines(bulk)
                         # 周期性刷新（如果启用）
                         try:
+                            now_ns = time.perf_counter_ns()
                             if EXPORT_WRITER_FLUSH_INTERVAL_MS and EXPORT_WRITER_FLUSH_INTERVAL_MS > 0:
-                                now_ns = time.perf_counter_ns()
                                 if (now_ns - last_flush_ns) >= int(EXPORT_WRITER_FLUSH_INTERVAL_MS) * 1_000_000:
                                     fh.flush()
                                     last_flush_ns = now_ns
+                            # 周期性丢弃导出文件的页面缓存，降低容器内 page cache 积累（可配置间隔）
+                            fadvise_interval_ns = max(0, int(EXPORT_WRITER_FADVISE_INTERVAL_MS)) * 1_000_000
+                            if fadvise_interval_ns > 0 and (now_ns - last_fadvise_ns) >= fadvise_interval_ns:
+                                try:
+                                    drop_file_cache_fd(fh.fileno())
+                                except Exception:
+                                    pass
+                                last_fadvise_ns = now_ns
                         except Exception:
                             pass
                     except Exception:
@@ -221,6 +238,11 @@ def start_export_stream(safe_kw: str, scope: str = 'single'):
                     fh.flush()
                     try:
                         os.fsync(fh.fileno())
+                    except Exception:
+                        pass
+                    # 在关闭前尝试丢弃该文件的页面缓存，降低容器内 page cache 占用
+                    try:
+                        drop_file_cache_fd(fh.fileno())
                     except Exception:
                         pass
                 except Exception:
@@ -290,6 +312,44 @@ def close_export_stream(safe_kw: str, scope: str = 'single'):
                 t.join()
         except Exception:
             pass
+        # 写入线程已退出：如启用则对导出文件进行按路径丢缓存，并执行多轮内存回收
+        try:
+            if EXPORT_CLOSE_RECLAIM_ENABLED:
+                path = info.get('path')
+                if path:
+                    try:
+                        drop_file_cache_path(path)
+                    except Exception:
+                        pass
+                # 多轮强回收：结合 gc/malloc_trim/drop_caches 与适度休眠
+                try:
+                    repeats = max(1, int(EXPORT_CLOSE_AGGRESSIVE_RECLAIM_REPEATS))
+                except Exception:
+                    repeats = 1
+                try:
+                    sleep_ms = max(0, int(EXPORT_CLOSE_AGGRESSIVE_RECLAIM_SLEEP_MS))
+                except Exception:
+                    sleep_ms = 0
+                for _ in range(repeats):
+                    try:
+                        gc.collect()
+                    except Exception:
+                        pass
+                    try:
+                        trim_process_memory()
+                    except Exception:
+                        pass
+                    try:
+                        aggressive_memory_reclaim()
+                    except Exception:
+                        pass
+                    if sleep_ms > 0:
+                        try:
+                            time.sleep(sleep_ms / 1000.0)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
         # 退出后再移除，避免在关闭期间 append 误判为不存在而重启新文件
         try:
             export_streams.pop(key, None)
@@ -331,3 +391,22 @@ def get_latest_export_filename(safe_kw: str, scope: str = 'single') -> str:
         return fn
     except Exception:
         return None
+
+
+def has_active_export_streams() -> bool:
+    """是否存在活跃的导出写入流（用于空闲内存回收的判定）。
+    只要后台写入线程仍存活，即视为活跃；关闭中的流也视为活跃直至线程退出。
+    """
+    try:
+        for info in list(export_streams.values()):
+            try:
+                t = info.get('thread')
+                if t and getattr(t, 'is_alive', lambda: False)():
+                    return True
+            except Exception:
+                # 保守判定：异常时视为活跃，避免在关闭中误触发强回收
+                return True
+        return False
+    except Exception:
+        # 出错时保守返回 True，避免误判空闲
+        return True
