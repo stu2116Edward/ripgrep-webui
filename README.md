@@ -13,8 +13,19 @@ curl -sS -O https://gitee.com/stu2116Edward/docker-tools/raw/master/docker_tools
 - 创建文件存储目录：
 ```bash
 mkdir -p /data/kuzi
+cd /data
 ```
 - 使用Docker命令部署
+```bash
+  docker run -d \
+  --name ripgrep-webui \
+  -p 5757:5000 \
+  -v /data/kuzi:/data:ro \
+  -v $(pwd)/exports:/app/exports \
+  --restart unless-stopped \
+  stu2116edwardhu/ripgrep-webui:beta
+```
+资源限制
 ```bash
 docker run -d \
   --name ripgrep-webui \
