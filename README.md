@@ -6,6 +6,32 @@ Visual Text Content Retrieval Tool
 本项目是基于 https://github.com/BurntSushi/ripgrep 实现的webui可视化操作工具  
 注意：在检索excel格式文件如`xls`,`xlsx`格式建议先转为csv格式（对于较大的excel格式文件会检索失败）
 
+
+## 项目结构
+<pre>
+项目根目录/
+├── main.py                 	# 应用入口
+├── config.py              	  # 配置项
+├── routes.py             	  # API路由
+├── search.py             	  # 流式检索核心
+├── export.py             	  # 导出管理
+├── process.py             	  # 进程管理
+├── utils.py                  # 通用工具
+├── handlers/              	  # 文件处理器
+│   ├── text.py            	  # 文本文件处理器
+│   ├── csv.py                # CSV处理器
+│   ├── compressed.py         # 压缩文件处理器
+├── templates/			          # 前端主题
+│   ├── index.html		        # 前端框架
+│   ├── css/			            #  样式目录
+│   │   └── style.css		      #  样式文件
+│   └── js/			              # 前端逻辑处理目录
+│       └── app.js		        # 前端逻辑脚本
+├── exports/			            # 导出文件目录
+└── requirements.txt	        # Python依赖清单
+</pre>
+
+
 ## Docker
 ### 安装Docker环境
 使用脚本自行安装
