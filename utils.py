@@ -12,8 +12,7 @@ import gc
 import ctypes
 
 from config import (
-    STREAM_CHUNK_SIZE,
-    SINGLE_COMPRESSED_EXTS, ARCHIVE_EXTS, EXCEL_EXTS, CSV_EXTS, TEXT_EXTS
+    SINGLE_COMPRESSED_EXTS, ARCHIVE_EXTS, CSV_EXTS, TEXT_EXTS
 )
 
 # 全局应用上下文（由 main.py 注入）
@@ -130,25 +129,18 @@ def is_archive_multi_file(filename_lower: str) -> bool:
     return filename_lower.endswith(ARCHIVE_EXTS)
 
 
-def is_excel_file(filename_lower: str) -> bool:
-    """判断是否为 Excel 文件。"""
-    return filename_lower.endswith(EXCEL_EXTS)
-
-
 def is_csv_file(filename_lower: str) -> bool:
     """判断是否为 CSV 文件。"""
     return filename_lower.endswith(CSV_EXTS)
 
 
 def classify_file_type(filename_lower: str):
-    """根据文件名后缀分类文件类型：archive/compressed/excel/csv/text/other"""
+    """根据文件名后缀分类文件类型：archive/compressed/csv/text/other"""
     fl = (filename_lower or '').lower()
     if is_archive_multi_file(fl):
         return 'archive'
     if is_single_file_compressed(fl):
         return 'compressed'
-    if is_excel_file(fl):
-        return 'excel'
     if is_csv_file(fl):
         return 'csv'
     if fl.endswith(TEXT_EXTS):
@@ -203,5 +195,197 @@ def trim_process_memory():
             except Exception:
                 # 非 GLIBC 或不可用时跳过
                 pass
+    except Exception:
+        pass
+
+
+def drop_file_cache_fd(fd: int):
+    """
+    尝试丢弃指定文件描述符的页面缓存（Linux：posix_fadvise DONTNEED）。
+    - 仅在类 Unix 环境下有效；Windows 跳过。
+    - 兼容 glibc 与 musl：优先加载 'libc.so.6'，失败则回退到 'libc.so' 或进程默认 libc（CDLL(None)）。
+    - 失败时静默忽略。
+    """
+    try:
+        if os.name == 'nt':
+            return
+        libc = None
+        try:
+            libc = ctypes.CDLL('libc.so.6')
+        except Exception:
+            try:
+                libc = ctypes.CDLL('libc.so')
+            except Exception:
+                try:
+                    # 在 musl（alpine）环境中使用进程默认 libc
+                    libc = ctypes.CDLL(None)
+                except Exception:
+                    libc = None
+        if libc is None:
+            return
+        POSIX_FADV_DONTNEED = 4
+        # 优先尝试 64 位符号，失败则回退到常规版本
+        try:
+            f = getattr(libc, 'posix_fadvise64')
+            f(ctypes.c_int(fd), ctypes.c_longlong(0), ctypes.c_longlong(0), ctypes.c_int(POSIX_FADV_DONTNEED))
+        except Exception:
+            try:
+                f = getattr(libc, 'posix_fadvise')
+                f(ctypes.c_int(fd), ctypes.c_long(0), ctypes.c_long(0), ctypes.c_int(POSIX_FADV_DONTNEED))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def drop_file_cache_range(fd: int, offset: int, length: int):
+    """
+    丢弃指定文件描述符在给定范围 [offset, offset+length) 的页面缓存。
+    - 仅类 Unix 环境有效；Windows 跳过。
+    - offset/length 需为非负且 length>0。
+    - 兼容 glibc 与 musl。
+    """
+    try:
+        if os.name == 'nt':
+            return
+        if offset is None or length is None:
+            return
+        if offset < 0 or length <= 0:
+            return
+        libc = None
+        try:
+            libc = ctypes.CDLL('libc.so.6')
+        except Exception:
+            try:
+                libc = ctypes.CDLL('libc.so')
+            except Exception:
+                try:
+                    libc = ctypes.CDLL(None)
+                except Exception:
+                    libc = None
+        if libc is None:
+            return
+        POSIX_FADV_DONTNEED = 4
+        # 优先使用 64 位版本（处理超大偏移），失败回退到常规版本
+        try:
+            f = getattr(libc, 'posix_fadvise64')
+            f(ctypes.c_int(fd), ctypes.c_longlong(offset), ctypes.c_longlong(length), ctypes.c_int(POSIX_FADV_DONTNEED))
+        except Exception:
+            try:
+                f = getattr(libc, 'posix_fadvise')
+                f(ctypes.c_int(fd), ctypes.c_long(offset), ctypes.c_long(length), ctypes.c_int(POSIX_FADV_DONTNEED))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def set_file_access_noreuse_fd(fd: int):
+    """
+    为给定文件描述符设置访问建议为 NOREUSE（不复用），提示内核尽快丢弃已用页面。
+    - 仅类 Unix 环境有效；Windows 跳过。
+    - 兼容 glibc 与 musl。
+    """
+    try:
+        if os.name == 'nt':
+            return
+        libc = None
+        try:
+            libc = ctypes.CDLL('libc.so.6')
+        except Exception:
+            try:
+                libc = ctypes.CDLL('libc.so')
+            except Exception:
+                try:
+                    libc = ctypes.CDLL(None)
+                except Exception:
+                    libc = None
+        if libc is None:
+            return
+        POSIX_FADV_NOREUSE = 5
+        try:
+            f = getattr(libc, 'posix_fadvise64')
+            f(ctypes.c_int(fd), ctypes.c_longlong(0), ctypes.c_longlong(0), ctypes.c_int(POSIX_FADV_NOREUSE))
+        except Exception:
+            try:
+                f = getattr(libc, 'posix_fadvise')
+                f(ctypes.c_int(fd), ctypes.c_long(0), ctypes.c_long(0), ctypes.c_int(POSIX_FADV_NOREUSE))
+            except Exception:
+                pass
+    except Exception:
+        pass
+def drop_file_cache_path(path: str):
+    """
+    尝试丢弃指定路径文件的页面缓存（打开只读后调用 fadvise DONTNEED）。
+    - 仅在类 Unix 环境下有效；Windows 跳过。
+    - 失败时静默忽略。
+    """
+    try:
+        if os.name == 'nt':
+            return
+        fd = None
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except Exception:
+            fd = None
+        if fd is None:
+            return
+        try:
+            drop_file_cache_fd(fd)
+        finally:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def aggressive_memory_reclaim():
+    """
+    在容器等环境下进行更强的内存回收尝试：
+    - 多次 gc.collect 与 malloc_trim，尽可能归还未使用堆内存
+    - 尝试 sync 并写入 /proc/sys/vm/drop_caches（需要权限，失败则忽略）
+    - Windows 下重复压缩工作集
+    """
+    try:
+        try:
+            gc.collect()
+            gc.collect()
+        except Exception:
+            pass
+
+        if os.name == 'nt':
+            try:
+                hproc = ctypes.windll.kernel32.GetCurrentProcess()
+                ctypes.windll.psapi.EmptyWorkingSet(hproc)
+                ctypes.windll.psapi.EmptyWorkingSet(hproc)
+            except Exception:
+                pass
+            return
+
+        # Unix/Linux: malloc_trim + 尝试 drop_caches
+        try:
+            libc = ctypes.CDLL('libc.so.6')
+            try:
+                libc.malloc_trim(0)
+                libc.malloc_trim(0)
+            except Exception:
+                pass
+            # 同步文件系统缓冲，提升丢弃页面缓存的成功率
+            try:
+                libc.sync()
+            except Exception:
+                pass
+        except Exception:
+            libc = None
+
+        # 尝试系统级丢弃缓存（可能需要 CAP_SYS_ADMIN，失败则忽略）
+        try:
+            with open('/proc/sys/vm/drop_caches', 'w') as f:
+                # 3 = pagecache + dentries + inodes
+                f.write('3\n')
+        except Exception:
+            pass
     except Exception:
         pass
