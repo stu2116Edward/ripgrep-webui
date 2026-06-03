@@ -1,7 +1,7 @@
 # ripgrep-webui
 Visual Text Content Retrieval Tool
 
-本项目是基于 https://github.com/BurntSushi/ripgrep 实现的webui可视化操作工具
+本项目是基于 https://github.com/BurntSushi/ripgrep 实现的webui可视化操作工具  
 支持 `.txt`,`.csv`等文本文件内容的流式检索  
 
 **注意**：如果是大文件检索或文件中关键字匹配数量过多建议关闭预览模式，如果检索崩溃建议刷新页面或手动重启容器  
