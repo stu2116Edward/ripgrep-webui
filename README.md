@@ -25,6 +25,16 @@ cd /data/kuzi
 ```
 - 使用Docker命令部署
 ```bash
+  docker run -d \
+  --name ripgrep-webui \
+  -p 5757:5000 \
+  -v /data/kuzi:/data:ro \
+  -v $(pwd)/exports:/app/exports \
+  --restart unless-stopped \
+  stu2116edwardhu/ripgrep-webui
+```
+资源限制
+```bash
 docker run -d \
   --name ripgrep-webui \
   -p 5757:5000 \
