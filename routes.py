@@ -13,11 +13,12 @@ from flask import (
 )
 
 from config import DEFAULT_DATA_DIR
-from utils import emit_message_utf, sanitize_keyword
-from search_engine import start_search
-from process_manager import cancel as cancel_search
-from process_manager import trigger_hot_reload_async
-from export_manager import get_exports_dir, get_latest_export_filename
+from utils import emit_message_utf, sanitize_keyword, drop_file_cache_path
+from search import start_search
+from process import cancel as cancel_search
+from process import trigger_hot_reload_async
+from export import get_exports_dir, get_latest_export_filename
+
 
 routes_bp = Blueprint('routes_bp', __name__)
 
@@ -51,7 +52,16 @@ def serve_export_file(filename):
     """直接提供导出文件的下载（避免额外目录扫描与内存占用）。"""
     try:
         exports_dir = get_exports_dir()
-        return send_from_directory(exports_dir, filename, as_attachment=True, conditional=True)
+        resp = send_from_directory(exports_dir, filename, as_attachment=True, conditional=True)
+        # 在响应关闭后丢弃该导出文件的页面缓存，降低容器内存占用
+        try:
+            exports_abs = os.path.abspath(exports_dir)
+            full_path = os.path.abspath(os.path.join(exports_dir, filename))
+            if full_path.startswith(exports_abs + os.sep):
+                resp.call_on_close(lambda: drop_file_cache_path(full_path))
+        except Exception:
+            pass
+        return resp
     except Exception:
         abort(404)
 
@@ -248,7 +258,16 @@ def download():
         # 未指定或未匹配到，选择最新
         candidates.sort(key=lambda n: os.path.getmtime(os.path.join(exports_dir, n)), reverse=True)
         chosen = candidates[0]
-    return send_from_directory(exports_dir, chosen, as_attachment=True)
+    resp = send_from_directory(exports_dir, chosen, as_attachment=True, conditional=True)
+    # 在响应关闭后丢弃该导出文件的页面缓存，提升容器内存稳定性
+    try:
+        exports_abs = os.path.abspath(exports_dir)
+        full_path = os.path.abspath(os.path.join(exports_dir, chosen))
+        if full_path.startswith(exports_abs + os.sep):
+            resp.call_on_close(lambda: drop_file_cache_path(full_path))
+    except Exception:
+        pass
+    return resp
 
 
 @routes_bp.route('/export-info')
