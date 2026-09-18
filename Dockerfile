@@ -11,7 +11,9 @@ RUN apk add --no-cache --virtual .build-deps \
     binutils \
     libffi-dev \
     curl \
-    tar
+    tar \
+    file \
+    make
 
 # 复制 requirements.txt
 COPY requirements.txt .
