@@ -289,6 +289,8 @@ let wasCancelled = false;
 let currentFileName = '';
 // 标记是否收到过字节级进度，用于避免单文件的初始回退跳到高百分比
 let hasByteProgress = false;
+// 标记上一次检索的关键词，避免输入框被清空后导出链接 keyword 变为默认值
+let lastSearchKeyword = '';
 // 标记上一次检索是否为“全部文件”模式，用于导出逻辑选择
 let lastSearchAll = false;
 // 标记是否已点击“清空”按钮，用于导出按钮仅提示
@@ -572,14 +574,17 @@ function updateExportLink() {
     // 检索进行中不更新下载链接，避免拿到旧文件
     if (running || pendingSubmit) return;
     const kwRaw = document.getElementById('keyword') ? (document.getElementById('keyword').value || '') : '';
-    const kw = (kwRaw || '').trim().replace(/[^\\w\u4e00-\u9fa5\-_ ]/g, '');
+    const kw = ((kwRaw || '').trim() || lastSearchKeyword || '').replace(/[^\\w\u4e00-\u9fa5\-_ ]/g, '');
     const fileSel = document.getElementById('file');
-    const fileVal = fileSel ? (fileSel.value || '') : '';
+    const fileRaw = fileSel ? (fileSel.value || '') : '';
+    const fileVal = (fileRaw === '__ALL__') ? '__ALL__' : '';
     const a = document.getElementById('exportLink');
     if (!a) return;
-    const fallback = '/download?keyword=' + encodeURIComponent(kw || 'search') + '&file=' + encodeURIComponent(fileVal || '');
+    const kwForUrl = encodeURIComponent(kw || 'search');
+    const fileForUrl = encodeURIComponent(fileVal);
+    const fallback = '/download?keyword=' + kwForUrl + '&file=' + fileForUrl;
     try {
-        trackedFetch('/export-info?keyword=' + encodeURIComponent(kw || 'search') + '&file=' + encodeURIComponent(fileVal || ''), {}, true)
+        trackedFetch('/export-info?keyword=' + kwForUrl + '&file=' + fileForUrl, {}, true)
             .then(r => r.ok ? r.json() : Promise.reject())
             .then(info => {
                 const href = (info && info.download_url) ? info.download_url : fallback;
@@ -589,11 +594,38 @@ function updateExportLink() {
             .catch(() => {
                 a.href = fallback;
                 try { a.setAttribute('download', ''); } catch (e) {}
+                // 延迟重试一次：可能导出流刚关闭，文件系统尚未刷新或输入框被清空导致 keyword 不对
+                setTimeout(() => {
+                    updateExportLinkRetry();
+                }, 800);
             });
     } catch (e) {
         a.href = fallback;
         try { a.setAttribute('download', ''); } catch (e2) {}
     }
+}
+
+function updateExportLinkRetry() {
+    const kwRaw = document.getElementById('keyword') ? (document.getElementById('keyword').value || '') : '';
+    const kw = ((kwRaw || '').trim() || lastSearchKeyword || '').replace(/[^\\w\u4e00-\u9fa5\-_ ]/g, '');
+    const fileSel = document.getElementById('file');
+    const fileRaw = fileSel ? (fileSel.value || '') : '';
+    const fileVal = (fileRaw === '__ALL__') ? '__ALL__' : '';
+    const a = document.getElementById('exportLink');
+    if (!a) return;
+    const kwForUrl = encodeURIComponent(kw || 'search');
+    const fileForUrl = encodeURIComponent(fileVal);
+    try {
+        trackedFetch('/export-info?keyword=' + kwForUrl + '&file=' + fileForUrl, {}, true)
+            .then(r => r.ok ? r.json() : Promise.reject())
+            .then(info => {
+                if (info && info.download_url) {
+                    a.href = info.download_url;
+                    try { a.setAttribute('download', ''); } catch (e) {}
+                }
+            })
+            .catch(() => {});
+    } catch (e) {}
 }
 
 function setupExportLink() {
@@ -807,6 +839,7 @@ socket.on('progress', data => {
 async function sendKeyword() {
     const kw = document.getElementById('keyword').value.trim();
     if (!kw) { alert('请输入关键词'); return; }
+    lastSearchKeyword = kw;
 
     const now = Date.now();
     if (running || pendingSubmit || (now - lastSubmitAt < DEBOUNCE_MS)) return;
@@ -878,6 +911,9 @@ async function sendKeyword() {
     }
     if (!file) { alert('请先选择文件'); pendingSubmit = false; return; }
     await singleSearch(kw, before, after, file);
+    running = false;
+    pendingSubmit = false;
+    try { updateExportLink(); } catch (e) {}
 }
 
 /**
@@ -926,6 +962,9 @@ async function singleSearch(kw, before, after, file, scope, resetAll = false, fi
                 finished = true;
                 cleanupSearchWaitListeners();
                 pendingSearchWaitResolve = null;
+                // 确保搜索结束状态立即标记，避免后续 updateExportLink() 被 running 条件拦截
+                running = false;
+                pendingSubmit = false;
                 resolve();
             };
             const handler = (data) => {
