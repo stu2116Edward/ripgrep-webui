@@ -58,8 +58,7 @@ ARCHIVE_EXTS = (
     ".7z", ".rar"
 )
 
-# 支持的电子表格/文本后缀
-EXCEL_EXTS = (".xls", ".xlsx")
+# 支持的文本后缀
 CSV_EXTS = (".csv",)
 
 # 额外的文本/数据类型扩展名
