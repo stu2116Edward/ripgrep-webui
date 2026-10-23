@@ -222,6 +222,17 @@ def download():
                         candidates.append(fn)
     except Exception:
         candidates = []
+
+    # 若目录扫描仍找不到，回退到内存中记录的最近导出文件名
+    if not candidates:
+        mem_fn = get_latest_export_filename(safe, scope=scope)
+        if mem_fn:
+            try:
+                if os.path.isfile(os.path.join(exports_dir, mem_fn)):
+                    candidates.append(mem_fn)
+            except Exception:
+                pass
+
     if not candidates:
         abort(404)
 
@@ -292,8 +303,24 @@ def export_info():
             for fn in os.listdir(exports_dir):
                 if fn.startswith(prefix):
                     candidates.append(fn)
+            # 若未找到，回退到仅关键字前缀
+            if not candidates:
+                for fn in os.listdir(exports_dir):
+                    if fn.startswith(safe):
+                        candidates.append(fn)
     except Exception:
         candidates = []
+
+    # 若目录扫描仍找不到，回退到内存中记录的最近导出文件名
+    if not candidates:
+        mem_fn = get_latest_export_filename(safe, scope=scope)
+        if mem_fn:
+            try:
+                if os.path.isfile(os.path.join(exports_dir, mem_fn)):
+                    candidates.append(mem_fn)
+            except Exception:
+                pass
+
     if not candidates:
         return jsonify({"exists": False}), 404
     candidates.sort(key=lambda n: os.path.getmtime(os.path.join(exports_dir, n)), reverse=True)
@@ -303,6 +330,8 @@ def export_info():
     def _stamp_of(fn: str) -> str:
         try:
             prefix = f"{safe}__{scope}_"
+            if not fn.startswith(prefix):
+                return ''
             rest = fn[len(prefix):]
             parts = rest.split('_')
             if len(parts) < 2:
