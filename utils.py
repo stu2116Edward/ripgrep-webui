@@ -12,7 +12,7 @@ import gc
 import ctypes
 
 from config import (
-    SINGLE_COMPRESSED_EXTS, ARCHIVE_EXTS, EXCEL_EXTS, CSV_EXTS, TEXT_EXTS
+    SINGLE_COMPRESSED_EXTS, ARCHIVE_EXTS, CSV_EXTS, TEXT_EXTS
 )
 
 # 全局应用上下文（由 main.py 注入）
@@ -129,25 +129,18 @@ def is_archive_multi_file(filename_lower: str) -> bool:
     return filename_lower.endswith(ARCHIVE_EXTS)
 
 
-def is_excel_file(filename_lower: str) -> bool:
-    """判断是否为 Excel 文件。"""
-    return filename_lower.endswith(EXCEL_EXTS)
-
-
 def is_csv_file(filename_lower: str) -> bool:
     """判断是否为 CSV 文件。"""
     return filename_lower.endswith(CSV_EXTS)
 
 
 def classify_file_type(filename_lower: str):
-    """根据文件名后缀分类文件类型：archive/compressed/excel/csv/text/other"""
+    """根据文件名后缀分类文件类型：archive/compressed/csv/text/other"""
     fl = (filename_lower or '').lower()
     if is_archive_multi_file(fl):
         return 'archive'
     if is_single_file_compressed(fl):
         return 'compressed'
-    if is_excel_file(fl):
-        return 'excel'
     if is_csv_file(fl):
         return 'csv'
     if fl.endswith(TEXT_EXTS):
