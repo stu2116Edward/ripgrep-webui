@@ -574,7 +574,7 @@ function updateExportLink() {
     // 检索进行中不更新下载链接，避免拿到旧文件
     if (running || pendingSubmit) return;
     const kwRaw = document.getElementById('keyword') ? (document.getElementById('keyword').value || '') : '';
-    const kw = ((kwRaw || '').trim() || lastSearchKeyword || '').replace(/[^\\w\u4e00-\u9fa5\-_ ]/g, '');
+    const kw = ((kwRaw || '').trim() || lastSearchKeyword || '').replace(/[^\w\u4e00-\u9fa5_ \-]/g, '');
     const fileSel = document.getElementById('file');
     const fileRaw = fileSel ? (fileSel.value || '') : '';
     const fileVal = (fileRaw === '__ALL__') ? '__ALL__' : '';
@@ -607,7 +607,7 @@ function updateExportLink() {
 
 function updateExportLinkRetry() {
     const kwRaw = document.getElementById('keyword') ? (document.getElementById('keyword').value || '') : '';
-    const kw = ((kwRaw || '').trim() || lastSearchKeyword || '').replace(/[^\\w\u4e00-\u9fa5\-_ ]/g, '');
+    const kw = ((kwRaw || '').trim() || lastSearchKeyword || '').replace(/[^\w\u4e00-\u9fa5_ \-]/g, '');
     const fileSel = document.getElementById('file');
     const fileRaw = fileSel ? (fileSel.value || '') : '';
     const fileVal = (fileRaw === '__ALL__') ? '__ALL__' : '';
