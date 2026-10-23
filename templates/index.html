@@ -32,7 +32,15 @@
             <form id="controls" class="mb-2 px-2 py-3 bg-white rounded shadow-sm">
                 <div class="row g-2 align-items-center">
                     <div class="col-12 col-md-5 mb-2 mb-md-0">
-                        <input type="text" id="keyword" class="form-control" placeholder="输入关键词" style="font-size:1.1em;">
+                        <div class="input-group">
+                            <input type="text" id="keyword" class="form-control" placeholder="输入关键词或正则" style="font-size:1.1em;">
+                            <div class="input-group-append">
+                                <div class="input-group-text">
+                                    <input type="checkbox" id="regexToggle" title="启用正则表达式">
+                                    <label for="regexToggle" class="mb-0 ml-1" style="font-size:0.85em;cursor:pointer;" title="启用正则表达式">正则</label>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                     <div class="col-6 col-md-2">
                         <input type="number" id="context_before" class="form-control" placeholder="上文" min="0">
