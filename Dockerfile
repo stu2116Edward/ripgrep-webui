@@ -11,7 +11,9 @@ RUN apk add --no-cache --virtual .build-deps \
     binutils \
     libffi-dev \
     curl \
-    tar
+    tar \
+    file \
+    make
 
 # 复制 requirements.txt
 COPY requirements.txt .
@@ -75,7 +77,9 @@ RUN mkdir -p templates exports
 
 # 复制应用代码
 COPY *.py ./
+COPY handlers/ ./handlers/
 COPY templates/ ./templates/
+
 
 # 设置环境变量
 ENV GUNICORN_CMD_ARGS="-w 1 -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker"
