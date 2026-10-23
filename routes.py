@@ -205,75 +205,42 @@ def download():
     scope = 'all' if (file_sel == '__ALL__') else 'single'
     safe = sanitize_keyword(keyword)
     exports_dir = get_exports_dir()
-    # 'all' 模式文件名已改为时间戳格式：<safe>__all_<YYYY-MM-DD>_<ts>.txt
 
-    candidates = []
-    try:
-        if os.path.isdir(exports_dir):
-            # 兼容旧命名：带 scope 的文件名前缀 <safe>__<scope>_
-            prefix = f"{safe}__{scope}_"
-            for fn in os.listdir(exports_dir):
-                if fn.startswith(prefix):
-                    candidates.append(fn)
-            # 若未找到，回退到仅关键字前缀
-            if not candidates:
-                for fn in os.listdir(exports_dir):
-                    if fn.startswith(safe):
-                        candidates.append(fn)
-    except Exception:
-        candidates = []
-
-    # 若目录扫描仍找不到，回退到内存中记录的最近导出文件名
-    if not candidates:
-        mem_fn = get_latest_export_filename(safe, scope=scope)
-        if mem_fn:
-            try:
-                if os.path.isfile(os.path.join(exports_dir, mem_fn)):
-                    candidates.append(mem_fn)
-            except Exception:
-                pass
-
-    if not candidates:
+    # 【直接使用内存记录】只认本次检索时创建的最新导出文件，去除目录扫描
+    mem_fn = get_latest_export_filename(safe, scope=scope)
+    if not mem_fn:
+        abort(404)
+    full_path = os.path.join(exports_dir, mem_fn)
+    if not os.path.isfile(full_path):
         abort(404)
 
-    # 如果提供了 stamp=MM-DD_ts，尝试精确匹配该文件
+    # 如果提供了 stamp=MM-DD_ts，校验是否与当前内存记录一致
     stamp = (request.args.get('stamp') or '').strip()
-    def _stamp_of(fn: str) -> str:
-        try:
-            prefix = f"{safe}__{scope}_"
-            if not fn.startswith(prefix):
-                return ''
-            rest = fn[len(prefix):]  # YYYY-MM-DD_<ts>.txt
-            parts = rest.split('_')
-            if len(parts) < 2:
-                return ''
-            date = parts[0]  # YYYY-MM-DD
-            ts_part = parts[1]
-            ts = ts_part.split('.')[0]
-            mmdd = date[5:] if len(date) >= 10 else ''
-            return f"{mmdd}_{ts}" if mmdd and ts else ''
-        except Exception:
-            return ''
-
-    chosen = None
     if stamp and len(stamp) >= 8:
-        # 基于传入的 MM-DD_ts 精确定位
-        for fn in candidates:
+        def _stamp_of(fn: str) -> str:
             try:
-                if _stamp_of(fn) == stamp:
-                    chosen = fn
-                    break
+                prefix = f"{safe}__{scope}_"
+                if not fn.startswith(prefix):
+                    return ''
+                rest = fn[len(prefix):]  # YYYY-MM-DD_<ts>.txt
+                parts = rest.split('_')
+                if len(parts) < 2:
+                    return ''
+                date = parts[0]
+                ts_part = parts[1]
+                ts = ts_part.split('.')[0]
+                mmdd = date[5:] if len(date) >= 10 else ''
+                return f"{mmdd}_{ts}" if mmdd and ts else ''
             except Exception:
-                pass
-    if not chosen:
-        # 未指定或未匹配到，选择最新
-        candidates.sort(key=lambda n: os.path.getmtime(os.path.join(exports_dir, n)), reverse=True)
-        chosen = candidates[0]
-    resp = send_from_directory(exports_dir, chosen, as_attachment=True, conditional=True)
+                return ''
+        if _stamp_of(mem_fn) != stamp:
+            abort(404)
+
+    resp = send_from_directory(exports_dir, mem_fn, as_attachment=True, conditional=True)
     # 在响应关闭后丢弃该导出文件的页面缓存，提升容器内存稳定性
     try:
         exports_abs = os.path.abspath(exports_dir)
-        full_path = os.path.abspath(os.path.join(exports_dir, chosen))
+        full_path = os.path.abspath(os.path.join(exports_dir, mem_fn))
         if full_path.startswith(exports_abs + os.sep):
             resp.call_on_close(lambda: drop_file_cache_path(full_path))
     except Exception:
@@ -296,35 +263,10 @@ def export_info():
     safe = sanitize_keyword(keyword)
     exports_dir = get_exports_dir()
 
-    candidates = []
-    try:
-        if os.path.isdir(exports_dir):
-            prefix = f"{safe}__{scope}_"
-            for fn in os.listdir(exports_dir):
-                if fn.startswith(prefix):
-                    candidates.append(fn)
-            # 若未找到，回退到仅关键字前缀
-            if not candidates:
-                for fn in os.listdir(exports_dir):
-                    if fn.startswith(safe):
-                        candidates.append(fn)
-    except Exception:
-        candidates = []
-
-    # 若目录扫描仍找不到，回退到内存中记录的最近导出文件名
-    if not candidates:
-        mem_fn = get_latest_export_filename(safe, scope=scope)
-        if mem_fn:
-            try:
-                if os.path.isfile(os.path.join(exports_dir, mem_fn)):
-                    candidates.append(mem_fn)
-            except Exception:
-                pass
-
-    if not candidates:
+    # 【直接使用内存记录】只认本次检索时创建的最新导出文件，去除目录扫描
+    mem_fn = get_latest_export_filename(safe, scope=scope)
+    if not mem_fn or not os.path.isfile(os.path.join(exports_dir, mem_fn)):
         return jsonify({"exists": False}), 404
-    candidates.sort(key=lambda n: os.path.getmtime(os.path.join(exports_dir, n)), reverse=True)
-    latest = candidates[0]
 
     # 提取 MM-DD_ts
     def _stamp_of(fn: str) -> str:
@@ -343,11 +285,11 @@ def export_info():
             return f"{mmdd}_{ts}" if mmdd and ts else ''
         except Exception:
             return ''
-    stamp = _stamp_of(latest)
+    stamp = _stamp_of(mem_fn)
     dl_url = f"/download?keyword={safe}&file={'__ALL__' if scope=='all' else ''}&stamp={stamp}" if stamp else f"/download?keyword={safe}&file={'__ALL__' if scope=='all' else ''}"
     return jsonify({
         "exists": True,
-        "filename": latest,
+        "filename": mem_fn,
         "stamp": stamp,
         "download_url": dl_url
     })
